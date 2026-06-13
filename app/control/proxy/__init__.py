@@ -6,6 +6,7 @@ configuration loading and clearance refresh lifecycle.
 """
 
 import asyncio
+import math
 from urllib.parse import urlparse
 
 from app.platform.logging.logger import logger
@@ -50,6 +51,10 @@ class ProxyDirectory:
         # Single-flight guard: at most one FlareSolverr call per proxy+host key.
         # Other coroutines wait on the Event until the active refresh completes.
         self._refresh_events: dict[BundleKey, asyncio.Event] = {}
+        # Cool-down guard: after a refresh failure, suppress immediate re-entry
+        # for the same proxy+host key and prefer the last known bundle.
+        self._refresh_backoff_until: dict[BundleKey, int] = {}
+        self._failure_counts: dict[BundleKey, int] = {}
         self._manual = ManualClearanceProvider()
         self._flare = FlareSolverrClearanceProvider()
         self._egress_mode: EgressMode = EgressMode.DIRECT
@@ -131,6 +136,16 @@ class ProxyDirectory:
             self._refresh_events = {
                 key: event
                 for key, event in self._refresh_events.items()
+                if key[0] in valid_affinities
+            }
+            self._refresh_backoff_until = {
+                key: until
+                for key, until in self._refresh_backoff_until.items()
+                if key[0] in valid_affinities
+            }
+            self._failure_counts = {
+                key: count
+                for key, count in self._failure_counts.items()
                 if key[0] in valid_affinities
             }
             self._config_sig = config_sig
@@ -261,6 +276,12 @@ class ProxyDirectory:
                 bundle = self._bundles.get(key)
                 if bundle and bundle.state.value == 0:  # VALID
                     return bundle
+                fallback = self._get_cooldown_bundle_locked(key, bundle)
+                if fallback:
+                    return fallback
+                until = self._refresh_backoff_until.get(key)
+                if until and until > now_ms():
+                    return None
                 event = self._refresh_events.get(key)
                 if event is None:
                     # This coroutine wins the right to refresh.
@@ -285,7 +306,10 @@ class ProxyDirectory:
             if bundle:
                 async with self._lock:
                     self._bundles[key] = bundle
-            return bundle
+                    self._record_refresh_success_locked(key)
+                return bundle
+            async with self._lock:
+                return self._record_refresh_failure_locked(key)
         finally:
             async with self._lock:
                 self._refresh_events.pop(key, None)
@@ -378,12 +402,80 @@ class ProxyDirectory:
             if new_bundle:
                 async with self._lock:
                     self._bundles[key] = new_bundle
+                    self._record_refresh_success_locked(key)
                 logger.debug("clearance bundle refreshed: bundle={}", key)
             else:
+                async with self._lock:
+                    fallback = self._record_refresh_failure_locked(key)
                 logger.warning(
-                    "clearance refresh failed, keeping old bundle: bundle={}",
+                    "clearance refresh failed, keeping old bundle: bundle={} fallback={} ",
                     key,
+                    bool(fallback),
                 )
+
+    def _backoff_config(self) -> tuple[int, int, float, int, int]:
+        cfg = get_config()
+        base_sec = max(1, cfg.get_int("proxy.clearance.failure_cooldown_sec", 300))
+        max_fails = max(1, cfg.get_int("proxy.clearance.max_consecutive_failures", 5))
+        multiplier = max(1.0, cfg.get_float("proxy.clearance.backoff_multiplier", 2.0))
+        max_sec = max(base_sec, cfg.get_int("proxy.clearance.max_cooldown_sec", 3600))
+        half_open_sec = max(1, cfg.get_int("proxy.clearance.half_open_probe_sec", 30))
+        return base_sec, max_fails, multiplier, max_sec, half_open_sec
+
+    def _get_cooldown_bundle_locked(
+        self,
+        key: BundleKey,
+        bundle: ClearanceBundle | None,
+    ) -> ClearanceBundle | None:
+        until = self._refresh_backoff_until.get(key)
+        if not until:
+            return None
+        now = now_ms()
+        if until <= now:
+            self._refresh_backoff_until.pop(key, None)
+            return None
+        if not bundle or not bundle.cf_cookies or not bundle.user_agent:
+            return None
+        from .models import ClearanceBundleState
+
+        if bundle.state == ClearanceBundleState.INVALID:
+            bundle = bundle.model_copy(update={"state": ClearanceBundleState.STALE})
+            self._bundles[key] = bundle
+        return bundle
+
+    def _record_refresh_failure_locked(self, key: BundleKey) -> ClearanceBundle | None:
+        base_sec, max_fails, multiplier, max_sec, half_open_sec = self._backoff_config()
+        n = self._failure_counts.get(key, 0) + 1
+        self._failure_counts[key] = n
+        if n >= max_fails:
+            cooldown_sec = half_open_sec
+        else:
+            cooldown_sec = min(max_sec, base_sec * math.pow(multiplier, n - 1))
+        cooldown_ms = int(cooldown_sec * 1000)
+        if cooldown_ms > 0:
+            self._refresh_backoff_until[key] = now_ms() + cooldown_ms
+        bundle = self._bundles.get(key)
+        fallback = self._get_cooldown_bundle_locked(key, bundle)
+        if fallback:
+            logger.warning(
+                "clearance refresh entering cooldown: bundle={} consecutive_failures={} cooldown_ms={} state={}",
+                key,
+                n,
+                cooldown_ms,
+                fallback.state,
+            )
+        else:
+            logger.warning(
+                "clearance refresh entering cooldown without fallback bundle: bundle={} consecutive_failures={} cooldown_ms={}",
+                key,
+                n,
+                cooldown_ms,
+            )
+        return fallback
+
+    def _record_refresh_success_locked(self, key: BundleKey) -> None:
+        self._failure_counts.pop(key, None)
+        self._refresh_backoff_until.pop(key, None)
 
     # ------------------------------------------------------------------
     # Properties
@@ -410,6 +502,98 @@ class ProxyDirectory:
     def bundles(self) -> dict[BundleKey, ClearanceBundle]:
         """Read-only snapshot of the current clearance bundles."""
         return dict(self._bundles)
+
+    @property
+    def refresh_backoff_until(self) -> dict[BundleKey, int]:
+        """Per-key cooldown expiry timestamps (ms since epoch).
+
+        Keys present in the returned dict are currently in cooldown.  The value
+        is the wall-clock timestamp at which cooldown expires and the key
+        becomes eligible for a fresh refresh attempt.
+        """
+        return dict(self._refresh_backoff_until)
+
+    @property
+    def failure_counts(self) -> dict[BundleKey, int]:
+        """Per-key consecutive failure counts.
+
+        Used by the scheduler to identify keys in half-open probe state
+        (``count >= max_consecutive_failures``) and to drive adaptive
+        scheduling decisions.
+        """
+        return dict(self._failure_counts)
+
+    # ------------------------------------------------------------------
+    # Filtered refresh (used by ProxyClearanceScheduler Stage 3)
+    # ------------------------------------------------------------------
+
+    async def refresh_clearance_filtered(
+        self,
+        skip_keys: set[BundleKey] | None = None,
+    ) -> None:
+        """Scheduled clearance refresh with per-key cooldown filtering.
+
+        Like :meth:`refresh_clearance_safe` but skips keys present in
+        *skip_keys*.  This avoids wasting FlareSolverr requests for keys
+        that are known to be in cooldown.
+
+        Existing behaviour of :meth:`refresh_clearance_safe` is untouched.
+        """
+        if self._clearance_mode == ClearanceMode.NONE:
+            return
+        skip = skip_keys or set()
+        async with self._lock:
+            nodes = list(self._nodes)
+            existing = list(self._bundles.keys())
+
+        refresh_targets: dict[BundleKey, tuple[str, str]] = {}
+        default_items = (
+            [(n.proxy_url or "direct", n.proxy_url or "") for n in nodes]
+            if nodes
+            else [("direct", "")]
+        )
+        for affinity, proxy_url in default_items:
+            key: BundleKey = (affinity, _clearance_host(_DEFAULT_CLEARANCE_ORIGIN))
+            refresh_targets[key] = (proxy_url, _DEFAULT_CLEARANCE_ORIGIN)
+        for key in existing:
+            affinity, clearance_host = key
+            refresh_targets.setdefault(
+                key,
+                ("" if affinity == "direct" else affinity, f"https://{clearance_host}"),
+            )
+
+        for key, (proxy_url, clearance_origin) in refresh_targets.items():
+            if key in skip:
+                logger.debug(
+                    "clearance refresh skipped (cooldown): bundle={}",
+                    key,
+                )
+                continue
+            affinity, clearance_host = key
+            if self._clearance_mode == ClearanceMode.MANUAL:
+                new_bundle = self._manual.build_bundle(
+                    affinity_key=affinity,
+                    clearance_host=clearance_host,
+                )
+            else:
+                new_bundle = await self._flare.refresh_bundle(
+                    affinity_key=affinity,
+                    proxy_url=proxy_url,
+                    target_url=clearance_origin,
+                )
+            if new_bundle:
+                async with self._lock:
+                    self._bundles[key] = new_bundle
+                    self._record_refresh_success_locked(key)
+                logger.debug("clearance bundle refreshed: bundle={}", key)
+            else:
+                async with self._lock:
+                    fallback = self._record_refresh_failure_locked(key)
+                logger.warning(
+                    "clearance refresh failed, keeping old bundle: bundle={} fallback={} ",
+                    key,
+                    bool(fallback),
+                )
 
 
 # ---------------------------------------------------------------------------

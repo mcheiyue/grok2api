@@ -100,6 +100,18 @@ flaresolverr_url = ""
 timeout_sec = 60
 # Clearance 刷新间隔（秒）
 refresh_interval = 3600
+# 启动时是否立即预热全部 clearance；FlareSolverr 不稳定时可关闭
+startup_warmup = true
+# 单个代理 clearance 刷新失败后的冷却时间（秒），避免失败后立刻重刷风暴
+failure_cooldown_sec = 300
+# 连续失败次数上限：达到后进入 half-open 状态，仅允许探测请求
+max_consecutive_failures = 5
+# 指数退避乘数（冷却时间 = base_cooldown * multiplier^(n-1)，n=连续失败次数）
+backoff_multiplier = 2.0
+# 退避冷却时间上限（秒）
+max_cooldown_sec = 3600
+# half-open 状态下探测请求的冷却时间（秒），用于在连续失败后快速重试
+half_open_probe_sec = 30
 
 
 # ==================== 重试策略 ====================
