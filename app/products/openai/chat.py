@@ -121,7 +121,7 @@ def _transport_upstream_error(exc: BaseException, *, context: str) -> UpstreamEr
 async def _quota_sync(token: str, mode_id: int) -> None:
     """Fire-and-forget: fetch real quota after a successful call."""
     try:
-        if current_strategy() != "quota":
+        if current_strategy() != "quota" and mode_id != 5:
             return
         svc = get_refresh_service()
         if svc:
@@ -587,6 +587,11 @@ async def _console_completions(
     # ``web_search`` tool in the request is preserved.
     console_tools = inject_web_search_tool(console_tools)
 
+    user_tool_names: set[str] | None = None
+    if console_tools:
+        names = {t.get("name") for t in console_tools if t.get("type") == "function" and t.get("name")}
+        user_tool_names = names if names else set()
+
     from app.dataplane.account import _directory as _acct_dir
 
     if _acct_dir is None:
@@ -618,7 +623,7 @@ async def _console_completions(
                 success = False
                 _retry = False
                 fail_exc: BaseException | None = None
-                adapter = ConsoleStreamAdapter()
+                adapter = ConsoleStreamAdapter(allowed_tool_names=user_tool_names)
                 tool_calls_emitted = False
 
                 try:
@@ -832,7 +837,7 @@ async def _console_completions(
 
                 full_text = extract_console_text(response_json)
                 full_thinking = (extract_console_reasoning(response_json) if emit_think else "")
-                response_tool_calls = extract_console_tool_calls(response_json)
+                response_tool_calls = extract_console_tool_calls(response_json, allowed_names=user_tool_names)
                 response_annotations = extract_console_annotations(response_json)
                 response_search_sources = extract_console_search_sources(response_json)
                 usage = extract_console_usage(response_json)

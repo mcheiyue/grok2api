@@ -45,6 +45,7 @@ import orjson
 from app.platform.config.snapshot import get_config
 from app.platform.errors import UpstreamError
 from app.platform.logging.logger import logger
+from app.dataplane.reverse.protocol.console_builtin_tools import is_console_builtin_tool
 
 # ---------------------------------------------------------------------------
 # Input conversion (OpenAI Chat Completions → console.x.ai input array)
@@ -376,16 +377,22 @@ def extract_console_reasoning(response_json: dict[str, Any]) -> str:
     return ""
 
 
-def extract_console_tool_calls(response_json: dict[str, Any], ) -> list[dict[str, Any]]:
-    """Extract tool calls from a non-streaming response.
+def extract_console_tool_calls(
+    response_json: dict[str, Any],
+    *,
+    allowed_names: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Extract tool calls from a non-streaming response, filtering built-in tools.
 
-    Returns a list of OpenAI Chat Completions tool_call dicts:
-        [{"id": "call_xxx", "type": "function",
-          "function": {"name": "...", "arguments": "..."}}]
+    Returns a list of OpenAI Chat Completions tool_call dicts for
+    **client-defined** function tools only.  Console built-in tools
+    (``web_search``, ``x_search``, ``browse_page``, ``code_execution``,
+    etc.) are silently dropped — they are executed server-side and must
+    never be forwarded as client tool_calls.
 
-    Console responses include each tool call as a top-level output item
-    of type ``function_call`` with a ``call_id``, ``name`` and
-    JSON-serialised ``arguments`` string.
+    *allowed_names*: when provided, only ``function_call`` items whose
+    ``name`` is in this set are returned.  Built-in tool names are
+    always excluded regardless of *allowed_names*.
     """
     output = response_json.get("output") or []
     calls: list[dict[str, Any]] = []
@@ -394,13 +401,18 @@ def extract_console_tool_calls(response_json: dict[str, Any], ) -> list[dict[str
             continue
         if item.get("type") != "function_call":
             continue
+        name = item.get("name") or ""
+        if is_console_builtin_tool(name):
+            continue
+        if allowed_names is not None and name not in allowed_names:
+            continue
         call_id = item.get("call_id") or item.get("id") or ""
         calls.append(
             {
                 "id": call_id,
                 "type": "function",
                 "function": {
-                    "name": item.get("name") or "",
+                    "name": name,
                     "arguments": item.get("arguments") or "{}",
                 },
             })
@@ -646,6 +658,7 @@ class ConsoleStreamAdapter:
         "_active_tool_index",
         "_tool_args_buf",
         "_seen_source_urls",
+        "_allowed_tool_names",
         "tool_calls",
         "annotations",
         "search_sources",
@@ -654,11 +667,12 @@ class ConsoleStreamAdapter:
         "_usage",
     )
 
-    def __init__(self) -> None:
+    def __init__(self, *, allowed_tool_names: set[str] | None = None) -> None:
         self._current_event: str = ""
         self._active_tool_index: dict[str, int] = {}  # item_id → index
         self._tool_args_buf: dict[str, list[str]] = {}  # item_id → args chunks
         self._seen_source_urls: set[str] = set()
+        self._allowed_tool_names = allowed_tool_names
         self.tool_calls: list[dict[str, Any]] = []
         self.annotations: list[dict[str, Any]] = []
         self.search_sources: list[dict[str, Any]] = []
@@ -734,6 +748,10 @@ class ConsoleStreamAdapter:
                 item_id = item.get("id") or item.get("call_id") or ""
                 call_id = item.get("call_id") or item_id
                 name = item.get("name") or ""
+                if is_console_builtin_tool(name):
+                    return {"kind": "skip"}
+                if self._allowed_tool_names is not None and name not in self._allowed_tool_names:
+                    return {"kind": "skip"}
                 idx = len(self.tool_calls)
                 self._active_tool_index[item_id] = idx
                 self._tool_args_buf[item_id] = []
