@@ -1,7 +1,9 @@
 """FlareSolverr-backed managed clearance provider."""
 
 import asyncio
+import hashlib
 import json
+from typing import TypeAlias, cast
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -10,13 +12,20 @@ from app.platform.logging.logger import logger
 from app.platform.config.snapshot import get_config
 from ..models import ClearanceBundle, ClearanceMode
 
+JSONDict: TypeAlias = dict[str, object]
+Cookie: TypeAlias = dict[str, object]
 
-def _extract_all_cookies(cookies: list[dict]) -> str:
-    return "; ".join(f"{c.get('name')}={c.get('value')}" for c in cookies)
+
+def _extract_all_cookies(cookies: list[Cookie]) -> str:
+    return "; ".join(f"{cookie.get('name')}={cookie.get('value')}" for cookie in cookies)
 
 
 class FlareSolverrClearanceProvider:
     """Refresh CF clearance bundles via a FlareSolverr instance."""
+
+    def __init__(self) -> None:
+        self._created_sessions: set[str] = set()
+        self._session_lock: asyncio.Lock = asyncio.Lock()
 
     async def refresh_bundle(
         self,
@@ -65,10 +74,19 @@ class FlareSolverrClearanceProvider:
         target_url:  str,
     ) -> dict[str, str] | None:
         target = target_url.strip() or "https://grok.com"
-        payload: dict = {
+        session = self._session_name(target, proxy_url)
+        if not await self._ensure_session(
+            fs_url      = fs_url,
+            session     = session,
+            proxy_url   = proxy_url,
+            timeout_sec = timeout_sec,
+        ):
+            return None
+        payload: JSONDict = {
             "cmd":        "request.get",
             "url":        target,
             "maxTimeout": timeout_sec * 1000,
+            "session":    session,
         }
         if proxy_url:
             payload["proxy"] = {"url": proxy_url}
@@ -82,9 +100,9 @@ class FlareSolverrClearanceProvider:
         )
 
         try:
-            def _post() -> dict:
+            def _post() -> JSONDict:
                 with urllib_request.urlopen(request, timeout=timeout_sec + 30) as resp:
-                    return json.loads(resp.read().decode())
+                    return cast(JSONDict, json.loads(resp.read().decode()))
 
             result = await asyncio.to_thread(_post)
             if result.get("status") != "ok":
@@ -94,13 +112,15 @@ class FlareSolverrClearanceProvider:
                 )
                 return None
 
-            solution = result.get("solution", {})
-            cookies  = solution.get("cookies", [])
+            solution_obj = result.get("solution", {})
+            solution = solution_obj if isinstance(solution_obj, dict) else {}
+            cookies_obj = solution.get("cookies", [])
+            cookies = cast(list[Cookie], cookies_obj if isinstance(cookies_obj, list) else [])
             if not cookies:
                 logger.warning("flaresolverr returned no cookies")
                 return None
 
-            ua = solution.get("userAgent", "") or ""
+            ua = str(solution.get("userAgent", "") or "")
             host = (urlparse(target).hostname or "").lower()
             filtered = [
                 cookie for cookie in cookies
@@ -121,6 +141,106 @@ class FlareSolverrClearanceProvider:
         except Exception as exc:
             logger.warning("flaresolverr request failed: error={}", exc)
 
+        await self._destroy_session(
+            fs_url      = fs_url,
+            session     = session,
+            timeout_sec = timeout_sec,
+        )
+
+        return None
+
+    def _session_name(self, target_url: str, proxy_url: str) -> str:
+        host = (urlparse(target_url).hostname or "grok.com").lower()
+        source = f"{host}|{proxy_url or '<direct>'}"
+        digest = hashlib.sha256(source.encode()).hexdigest()[:16]
+        return f"grok2api-{host.replace('.', '-')}-{digest}"
+
+    async def _ensure_session(
+        self,
+        *,
+        fs_url:      str,
+        session:     str,
+        proxy_url:   str,
+        timeout_sec: int,
+    ) -> bool:
+        async with self._session_lock:
+            if session in self._created_sessions:
+                return True
+            payload: JSONDict = {
+                "cmd":     "sessions.create",
+                "session": session,
+            }
+            if proxy_url:
+                payload["proxy"] = {"url": proxy_url}
+            result = await self._post_json(
+                fs_url      = fs_url,
+                payload     = payload,
+                timeout_sec = min(timeout_sec, 30),
+            )
+            status = result.get("status") if result else ""
+            message = str(result.get("message", "")) if result else ""
+            if status == "ok" or "already" in message.lower():
+                self._created_sessions.add(session)
+                logger.info("flaresolverr session ready: session={}", session)
+                return True
+            logger.warning(
+                "flaresolverr session create failed: session={} status={} message={}",
+                session, status, message,
+            )
+            return False
+
+    async def _destroy_session(
+        self,
+        *,
+        fs_url:      str,
+        session:     str,
+        timeout_sec: int,
+    ) -> None:
+        async with self._session_lock:
+            self._created_sessions.discard(session)
+        payload: JSONDict = {
+            "cmd":     "sessions.destroy",
+            "session": session,
+        }
+        result = await self._post_json(
+            fs_url      = fs_url,
+            payload     = payload,
+            timeout_sec = min(timeout_sec, 15),
+        )
+        status = result.get("status") if result else ""
+        if status == "ok":
+            logger.info("flaresolverr session destroyed after failed refresh: session={}", session)
+            return
+        logger.warning("flaresolverr session destroy failed: session={} status={}", session, status)
+
+    async def _post_json(
+        self,
+        *,
+        fs_url:      str,
+        payload:     JSONDict,
+        timeout_sec: int,
+    ) -> JSONDict | None:
+        body = json.dumps(payload).encode()
+        request = urllib_request.Request(
+            f"{fs_url.rstrip('/')}/v1",
+            data    = body,
+            method  = "POST",
+            headers = {"Content-Type": "application/json"},
+        )
+
+        def _post() -> JSONDict:
+            with urllib_request.urlopen(request, timeout=timeout_sec) as resp:
+                return cast(JSONDict, json.loads(resp.read().decode()))
+
+        try:
+            return await asyncio.to_thread(_post)
+        except HTTPError as exc:
+            body_text = exc.read().decode("utf-8", "replace")[:300]
+            logger.warning("flaresolverr http request failed: status={} body={}", exc.code, body_text)
+        except URLError as exc:
+            logger.warning("flaresolverr connection failed: reason={}", exc.reason)
+        except Exception as exc:
+            logger.warning("flaresolverr request failed: error={}", exc)
         return None
 
 
