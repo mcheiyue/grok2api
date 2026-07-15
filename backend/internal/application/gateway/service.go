@@ -123,7 +123,7 @@ func (s *Service) ConfigureMedia(repository repository.MediaJobRepository, concu
 func NewService(models routeResolver, audits auditRecorder, accounts *accountapp.Service, clientKeys *clientkeyapp.Service, providers *provider.Registry, selector *Selector, responses repository.ResponseRepository, maxAttempts int) *Service {
 	service := &Service{
 		models: models, audits: audits, accounts: accounts, clientKeys: clientKeys, providers: providers,
-		selector: selector, consoleBreaker: newConsoleTeamCircuitBreaker(0), responses: responses, logger: slog.Default(),
+		selector: selector, consoleBreaker: newConsoleTeamCircuitBreaker(0, 0, 0), responses: responses, logger: slog.Default(),
 	}
 	service.UpdateMaxAttempts(maxAttempts)
 	return service
@@ -136,6 +136,15 @@ func (s *Service) SetLogger(logger *slog.Logger) {
 }
 
 func (s *Service) UpdateMaxAttempts(maxAttempts int) { s.maxAttempts.Store(int64(maxAttempts)) }
+
+// ConfigureConsoleTeamCircuit 热更新 Console team 熔断秒数（RPM/RPS/unknown）；≤0 回落默认。
+// 不清除已有冷却条目的 until（新 trip 用新秒数；remaining 仍按旧 until 生效至过期）。
+func (s *Service) ConfigureConsoleTeamCircuit(rpmSec, rpsSec, unknownSec int) {
+	if s == nil {
+		return
+	}
+	s.consoleBreaker = newConsoleTeamCircuitBreaker(rpmSec, rpsSec, unknownSec)
+}
 
 func (s *Service) CreateResponse(ctx context.Context, input Input) (*Result, error) {
 	input.Operation = audit.OperationResponses

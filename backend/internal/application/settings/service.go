@@ -269,9 +269,13 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		MediaConcurrency: value.ProviderWeb.MediaConcurrency, AllowNSFW: value.ProviderWeb.AllowNSFW,
 		RecoveryBackoffBase: config.Duration(value.ProviderWeb.RecoveryBackoffBase), RecoveryBackoffMax: config.Duration(value.ProviderWeb.RecoveryBackoffMax),
 	}
+	// Team 熔断秒数目前仅 YAML/默认值可配，Admin 热更不覆盖。
 	base.Provider.Console = config.ConsoleProviderConfig{
 		BaseURL: value.ProviderConsole.BaseURL, UserAgent: value.ProviderConsole.UserAgent,
-		ChatTimeout: config.Duration(value.ProviderConsole.ChatTimeout),
+		ChatTimeout:            config.Duration(value.ProviderConsole.ChatTimeout),
+		TeamRPMCooldownSec:     base.Provider.Console.TeamRPMCooldownSec,
+		TeamRPSCooldownSec:     base.Provider.Console.TeamRPSCooldownSec,
+		TeamUnknownCooldownSec: base.Provider.Console.TeamUnknownCooldownSec,
 	}
 	randomDelay := time.Duration(-1)
 	if value.Batch.RandomDelay != nil {

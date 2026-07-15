@@ -36,7 +36,7 @@ func TestConsoleTeamCircuitBreakerTripAndBlock(t *testing.T) {
 	consoleCooldownNow = func() time.Time { return fixed }
 	t.Cleanup(func() { consoleCooldownNow = time.Now })
 
-	cb := newConsoleTeamCircuitBreaker(75)
+	cb := newConsoleTeamCircuitBreaker(75, 0, 0)
 	key := consoleModelCooldownKey("grok-4.20-multi-agent-0309")
 	if cb.remaining(key) != 0 {
 		t.Fatal("expected free")
@@ -62,10 +62,49 @@ func TestConsoleTeamCircuitBreakerRPSShort(t *testing.T) {
 	consoleCooldownNow = func() time.Time { return fixed }
 	t.Cleanup(func() { consoleCooldownNow = time.Now })
 
-	cb := newConsoleTeamCircuitBreaker(75)
+	cb := newConsoleTeamCircuitBreaker(75, 0, 0)
 	key := consoleModelCooldownKey("grok-4.3")
 	d, kind := cb.trip(key, console429Info{PerSecondActual: 3, PerSecondLimit: 3, IsPerSecondHit: true})
 	if kind != "rps" || d != 3*time.Second {
 		t.Fatalf("d=%v kind=%s", d, kind)
+	}
+}
+
+func TestConsoleTeamCircuitBreakerCustomSeconds(t *testing.T) {
+	fixed := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	consoleCooldownNow = func() time.Time { return fixed }
+	t.Cleanup(func() { consoleCooldownNow = time.Now })
+
+	cb := newConsoleTeamCircuitBreaker(120, 10, 7)
+	key := consoleModelCooldownKey("grok-4.3")
+	d, kind := cb.trip(key, console429Info{PerMinuteActual: 10, PerMinuteLimit: 5, IsPerMinuteHit: true})
+	if kind != "rpm" || d != 120*time.Second {
+		t.Fatalf("custom rpm d=%v kind=%s", d, kind)
+	}
+	// 过期后 RPS 用自定义 10s
+	consoleCooldownNow = func() time.Time { return fixed.Add(121 * time.Second) }
+	d2, kind2 := cb.trip(key, console429Info{PerSecondActual: 5, PerSecondLimit: 3, IsPerSecondHit: true})
+	if kind2 != "rps" || d2 != 10*time.Second {
+		t.Fatalf("custom rps d=%v kind=%s", d2, kind2)
+	}
+	consoleCooldownNow = func() time.Time { return fixed.Add(200 * time.Second) }
+	d3, kind3 := cb.trip(key, console429Info{})
+	if kind3 != "unknown" || d3 != 7*time.Second {
+		t.Fatalf("custom unknown d=%v kind=%s", d3, kind3)
+	}
+}
+
+func TestServiceConfigureConsoleTeamCircuit(t *testing.T) {
+	svc := &Service{}
+	svc.ConfigureConsoleTeamCircuit(90, 4, 6)
+	if svc.consoleBreaker == nil || svc.consoleBreaker.rpmCooldownSec != 90 ||
+		svc.consoleBreaker.rpsCooldownSec != 4 || svc.consoleBreaker.unknownSec != 6 {
+		t.Fatalf("breaker=%#v", svc.consoleBreaker)
+	}
+	svc.ConfigureConsoleTeamCircuit(0, 0, 0)
+	if svc.consoleBreaker.rpmCooldownSec != consoleRPMCooldownSec ||
+		svc.consoleBreaker.rpsCooldownSec != consoleRPSCooldownSec ||
+		svc.consoleBreaker.unknownSec != consoleUnknownCooldownSec {
+		t.Fatalf("defaults not applied: %#v", svc.consoleBreaker)
 	}
 }

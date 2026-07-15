@@ -44,15 +44,22 @@ type consoleTeamCircuitBreaker struct {
 	unknownSec     int
 }
 
-func newConsoleTeamCircuitBreaker(rpmCooldownSec int) *consoleTeamCircuitBreaker {
+// newConsoleTeamCircuitBreaker 创建 team 熔断；秒数 ≤0 时用 Gork 默认 75/3/5。
+func newConsoleTeamCircuitBreaker(rpmCooldownSec, rpsCooldownSec, unknownCooldownSec int) *consoleTeamCircuitBreaker {
 	if rpmCooldownSec <= 0 {
 		rpmCooldownSec = consoleRPMCooldownSec
+	}
+	if rpsCooldownSec <= 0 {
+		rpsCooldownSec = consoleRPSCooldownSec
+	}
+	if unknownCooldownSec <= 0 {
+		unknownCooldownSec = consoleUnknownCooldownSec
 	}
 	return &consoleTeamCircuitBreaker{
 		byModel:        make(map[string]consoleCooldownEntry),
 		rpmCooldownSec: rpmCooldownSec,
-		rpsCooldownSec: consoleRPSCooldownSec,
-		unknownSec:     consoleUnknownCooldownSec,
+		rpsCooldownSec: rpsCooldownSec,
+		unknownSec:     unknownCooldownSec,
 	}
 }
 

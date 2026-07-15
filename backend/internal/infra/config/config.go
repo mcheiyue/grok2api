@@ -148,6 +148,10 @@ type ConsoleProviderConfig struct {
 	BaseURL     string   `yaml:"baseURL"`
 	UserAgent   string   `yaml:"userAgent"`
 	ChatTimeout Duration `yaml:"chatTimeout"`
+	// Team 熔断秒数（W2.2/W2.3）：RPM/RPS/unknown；0 表示用默认 75/3/5。
+	TeamRPMCooldownSec     int `yaml:"teamRPMCooldownSec"`
+	TeamRPSCooldownSec     int `yaml:"teamRPSCooldownSec"`
+	TeamUnknownCooldownSec int `yaml:"teamUnknownCooldownSec"`
 }
 
 // BatchConfig 定义可热加载的账号批量任务并发上限。
@@ -423,6 +427,11 @@ func (c Config) Validate() error {
 	if c.Provider.Console.ChatTimeout.Value() < 5*time.Second || c.Provider.Console.ChatTimeout.Value() > 30*time.Minute {
 		return errors.New("provider.console.chatTimeout 必须在 5 秒到 30 分钟之间")
 	}
+	if c.Provider.Console.TeamRPMCooldownSec < 0 || c.Provider.Console.TeamRPMCooldownSec > 3600 ||
+		c.Provider.Console.TeamRPSCooldownSec < 0 || c.Provider.Console.TeamRPSCooldownSec > 600 ||
+		c.Provider.Console.TeamUnknownCooldownSec < 0 || c.Provider.Console.TeamUnknownCooldownSec > 600 {
+		return errors.New("provider.console team 熔断秒数超出允许范围")
+	}
 	if c.Batch.ImportConcurrency < 1 || c.Batch.ImportConcurrency > 50 ||
 		c.Batch.ConversionConcurrency < 1 || c.Batch.ConversionConcurrency > 50 ||
 		c.Batch.SyncConcurrency < 1 || c.Batch.SyncConcurrency > 50 ||
@@ -486,7 +495,10 @@ func defaultConfig() Config {
 			},
 			Console: ConsoleProviderConfig{
 				BaseURL: "https://console.x.ai", UserAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-				ChatTimeout: Duration(5 * time.Minute),
+				ChatTimeout:            Duration(5 * time.Minute),
+				TeamRPMCooldownSec:     75,
+				TeamRPSCooldownSec:     3,
+				TeamUnknownCooldownSec: 5,
 			},
 		},
 		Batch: BatchConfig{

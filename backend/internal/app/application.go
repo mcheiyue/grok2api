@@ -236,6 +236,11 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	gatewayService := gateway.NewService(modelService, auditService, accountService, clientKeyService, providers, selector, responseRepo, cfg.Routing.MaxAttempts)
 	gatewayService.SetLogger(logger)
 	gatewayService.ConfigureMedia(mediaJobRepo, cfg.Provider.Web.MediaConcurrency)
+	gatewayService.ConfigureConsoleTeamCircuit(
+		cfg.Provider.Console.TeamRPMCooldownSec,
+		cfg.Provider.Console.TeamRPSCooldownSec,
+		cfg.Provider.Console.TeamUnknownCooldownSec,
+	)
 	quotaRecoveryService := quotarecoveryapp.NewService(logger, quotaQueue, accountService, cfg.Provider.Web.RecoveryBackoffBase.Value(), cfg.Provider.Web.RecoveryBackoffMax.Value())
 	quotaRecoveryService.SetBulkPool(syncPool)
 	inferenceConcurrency := httpmiddleware.NewConcurrencyGate(cfg.Server.MaxConcurrentRequests)
@@ -272,6 +277,11 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		accountSyncService.UpdateConcurrency(next.Batch.ImportConcurrency)
 		selector.UpdateConfig(next.Routing.StickyTTL.Value(), next.Routing.CooldownBase.Value(), next.Routing.CooldownMax.Value(), next.Routing.CapacityWait.Value())
 		gatewayService.UpdateMaxAttempts(next.Routing.MaxAttempts)
+		gatewayService.ConfigureConsoleTeamCircuit(
+			next.Provider.Console.TeamRPMCooldownSec,
+			next.Provider.Console.TeamRPSCooldownSec,
+			next.Provider.Console.TeamUnknownCooldownSec,
+		)
 		auditService.UpdateConfig(next.Audit.BatchSize, next.Audit.FlushInterval.Value())
 		clientKeyService.UpdateDefaults(next.ClientKeyDefaults.RPMLimit, next.ClientKeyDefaults.MaxConcurrent)
 	})
