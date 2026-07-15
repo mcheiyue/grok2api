@@ -10,7 +10,7 @@
 | 上游 | `https://github.com/chenyme/grok2api` |
 | 本地路径 | `D:\OpenCode\VPS\Grok改造\chen-fork\` |
 | W0 基线 tip | **`90ec921`**（同步 upstream/main，含 #636 一带） |
-| 本地 tip（含改造） | **`93c6ea1`**（W2.3 team 熔断可配置 + 失败分类测试） |
+| 本地 tip（含改造） | **W2.5**：`docker-compose.warp.yml` + 主 compose 注释（在 93c6ea1/28e6c49 之上） |
 | 上游版本文件 | `VERSION` = `v3.0.0` |
 | 镜像（fork 推 main 后） | `ghcr.io/mcheiyue/grok2api:latest`（workflow 按 `GITHUB_REPOSITORY` 命名） |
 

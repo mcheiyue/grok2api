@@ -1,0 +1,38 @@
+# 可选防封边车：与 docker-compose.yml 叠加使用。
+#   docker compose -f docker-compose.yml -f docker-compose.warp.yml up -d
+#
+# 启用后在管理端「设置 → 出口代理」新增节点，例如：
+#   Proxy URL : socks5h://warp:1080
+#   Scope     : grok_build / grok_console / grok_web / grok_web_asset（按需）
+# CF cookie 需手工写入节点（本 profile 不自动刷 clearance；可选 flaresolverr 辅助人工）。
+# 详见 plans/W2.5-防封egress方案.md（仓库上级 Grok改造/plans/）。
+
+services:
+  warp:
+    container_name: warp
+    image: caomingjun/warp:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1080:1080"
+    environment:
+      - WARP_SLEEP=2
+    cap_add:
+      - NET_ADMIN
+    # 部分内核需要：
+    # cap_add:
+    #   - NET_ADMIN
+    #   - SYS_MODULE
+    # sysctls:
+    #   - net.ipv6.conf.all.disable_ipv6=0
+    #   - net.ipv4.conf.all.src_valid_mark=1
+
+  # 可选：人工过 CF 用，不接线进 chen 自动 cookie 刷新。
+  # flaresolverr:
+  #   container_name: flaresolverr
+  #   image: ghcr.io/flaresolverr/flaresolverr:latest
+  #   restart: unless-stopped
+  #   environment:
+  #     TZ: ${TZ:-Asia/Shanghai}
+  #     LOG_LEVEL: info
+  #   ports:
+  #     - "127.0.0.1:8191:8191"

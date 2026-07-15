@@ -17,18 +17,10 @@ services:
     security_opt:
       - no-new-privileges:true
 
-  # 如果出口 IP 不干净，可取消以下注释使用 WARP 作为落地代理。
-  # 启用后，在管理端“设置 -> 出口代理”中新增 socks5://warp:1080。
-  # warp:
-  #   container_name: warp
-  #   image: caomingjun/warp:latest
-  #   restart: unless-stopped
-  #   ports:
-  #     - "127.0.0.1:1080:1080"
-  #   environment:
-  #     - WARP_SLEEP=2
-  #   cap_add:
-  #     - NET_ADMIN
+  # 可选 WARP / 防封边车见独立文件（W2.5）：
+  #   docker compose -f docker-compose.yml -f docker-compose.warp.yml up -d
+  # 管理端出口节点填 socks5h://warp:1080；方案文档：仓库外 plans/W2.5-防封egress方案.md
+  # （旧内联 warp 注释已迁至 docker-compose.warp.yml，避免与 profile 双份漂移。）
 
 volumes:
   grok2api-data:
