@@ -45,6 +45,7 @@ const (
 	SelectionUnsupportedModel SelectionUnavailableReason = "unsupported_model"
 	SelectionCooling          SelectionUnavailableReason = "cooling"
 	SelectionModelCooling     SelectionUnavailableReason = "model_cooling"
+	SelectionTeamRateLimit    SelectionUnavailableReason = "team_rate_limit"
 	SelectionQuotaExhausted   SelectionUnavailableReason = "quota_exhausted"
 	SelectionSaturated        SelectionUnavailableReason = "saturated"
 )
@@ -65,13 +66,15 @@ func (e *SelectionUnavailableError) Error() string {
 	case SelectionCooling:
 		return "可用上游账号正在冷却"
 	case SelectionModelCooling:
-		return "可用上游账号的目标模型正在冷却"
+			return "可用上游账号的目标模型正在冷却"
+	case SelectionTeamRateLimit:
+			return "Console team 速率限制冷却中"
 	case SelectionQuotaExhausted:
-		return "可用上游账号额度等待恢复"
+			return "可用上游账号额度等待恢复"
 	case SelectionSaturated:
-		return "可用上游账号均达到并发上限"
+			return "可用上游账号均达到并发上限"
 	default:
-		return "没有可用上游账号"
+			return "没有可用上游账号"
 	}
 }
 

@@ -1098,6 +1098,8 @@ func selectionErrorResponse(c *gin.Context, failure *gateway.SelectionUnavailabl
 		status, code, message = http.StatusTooManyRequests, "upstream_cooling", "上游账号正在冷却"
 	case gateway.SelectionModelCooling:
 		status, code, message = http.StatusTooManyRequests, "upstream_model_cooling", "上游账号的目标模型正在冷却"
+	case gateway.SelectionTeamRateLimit:
+		status, code, message = http.StatusTooManyRequests, "console_team_rate_limit", "Console team 速率限制冷却中"
 	case gateway.SelectionQuotaExhausted:
 		status, code, message = http.StatusTooManyRequests, "upstream_quota_exhausted", "上游账号额度等待恢复"
 	case gateway.SelectionSaturated:

@@ -98,6 +98,7 @@ type Service struct {
 	clientKeys     *clientkeyapp.Service
 	providers      *provider.Registry
 	selector       *Selector
+	consoleBreaker *consoleTeamCircuitBreaker
 	responses      repository.ResponseRepository
 	maxAttempts    atomic.Int64
 	mediaJobs      repository.MediaJobRepository
@@ -120,7 +121,10 @@ func (s *Service) ConfigureMedia(repository repository.MediaJobRepository, concu
 }
 
 func NewService(models routeResolver, audits auditRecorder, accounts *accountapp.Service, clientKeys *clientkeyapp.Service, providers *provider.Registry, selector *Selector, responses repository.ResponseRepository, maxAttempts int) *Service {
-	service := &Service{models: models, audits: audits, accounts: accounts, clientKeys: clientKeys, providers: providers, selector: selector, responses: responses, logger: slog.Default()}
+	service := &Service{
+		models: models, audits: audits, accounts: accounts, clientKeys: clientKeys, providers: providers,
+		selector: selector, consoleBreaker: newConsoleTeamCircuitBreaker(0), responses: responses, logger: slog.Default(),
+	}
 	service.UpdateMaxAttempts(maxAttempts)
 	return service
 }
@@ -345,6 +349,14 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	if ownership != nil {
 		attempts = 1
 	}
+	// Console team 熔断：multi-agent 共享键；冷却期内直接 429，避免空转换号。
+	consoleCooldownKey := ""
+	if isConsoleProvider(route.Provider) && ownership == nil {
+		consoleCooldownKey = consoleModelCooldownKey(route.UpstreamModel)
+		if rem := s.consoleBreaker.remaining(consoleCooldownKey); rem > 0 {
+			return nil, &SelectionUnavailableError{Reason: SelectionTeamRateLimit, RetryAfter: rem}
+		}
+	}
 	pricingModel := s.providers.PricingModel(route.Provider, route.UpstreamModel)
 	if reservation, priced := audit.EstimateOfficialTextReservation(pricingModel, input.Body); priced {
 		if _, err := s.clientKeys.ReserveBilling(ctx, input.ClientKey, eventID, reservation.CostInUSDTicks, textBillingReservationTTL); err != nil {
@@ -491,6 +503,22 @@ attemptLoop:
 				continue
 			}
 			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
+			// Console 429：按 RPS/RPM 跳闸 team 熔断；RPM 不再换号空转。
+			if response.StatusCode == http.StatusTooManyRequests && consoleCooldownKey != "" {
+				info := parseConsole429Info(string(body))
+				cooldown, kind := s.consoleBreaker.trip(consoleCooldownKey, info)
+				s.logger.Warn("console_team_circuit_tripped",
+					"request_id", input.RequestID, "key", consoleCooldownKey, "kind", kind,
+					"cooldown_sec", int(cooldown.Seconds()), "account_id", credential.ID)
+				if kind == "rpm" {
+					if lastFailure.AccountScoped {
+						s.selector.MarkFailure(ctx, credential, response.StatusCode, cooldown)
+					}
+					lease.Release()
+					lastErr = &SelectionUnavailableError{Reason: SelectionTeamRateLimit, RetryAfter: cooldown}
+					break attemptLoop
+				}
+			}
 			if s.providers.SupportsCredentialRefresh(credential.Provider) && !authRecoveryAttempted[credential.ID] && credential.EncryptedRefreshToken != "" && (lastFailure.PermanentAccountDenial || lastFailure.CredentialRejected) {
 				authRecoveryAttempted[credential.ID] = true
 				refreshed, refreshErr := ensureCredential(credential, true)
@@ -634,6 +662,28 @@ attemptLoop:
 		timingHandedOff = true
 		return &Result{StatusCode: response.StatusCode, Status: response.Status, Header: response.Header, Body: &finalizingBody{ReadCloser: response.Body, finalize: func() { finalize(Usage{}, "", "stream_closed") }}, Finalize: finalize}, nil
 	}
+	// Console team 熔断优先：保留 Retry-After，避免被 UpstreamFailure 盖掉。
+	var teamLimit *SelectionUnavailableError
+	if errors.As(lastErr, &teamLimit) && teamLimit.Reason == SelectionTeamRateLimit {
+		record := auditBase
+		record.StatusCode = http.StatusTooManyRequests
+		record.DurationMS = time.Since(startedAt).Milliseconds()
+		record.ErrorCode = "console_team_rate_limit"
+		record.Attempts = failureAttempts.snapshot()
+		record.CreatedAt = time.Now().UTC()
+		applyAuditEgress(&record, egressTrace, route.Provider)
+		if lastFailure != nil && lastFailure.AccountID != 0 {
+			accountID := lastFailure.AccountID
+			record.AccountID = &accountID
+			record.AccountName = lastFailure.AccountName
+		}
+		persistCtx, cancel := context.WithTimeout(context.Background(), finalizationTimeout)
+		defer cancel()
+		if err := s.audits.Create(persistCtx, record); err != nil {
+			s.logger.Error("request_usage_write_failed", "event_id", record.EventID, "request_id", input.RequestID, "error", err)
+		}
+		return nil, teamLimit
+	}
 	if lastFailure != nil {
 		record := auditBase
 		record.StatusCode = lastFailure.HTTPStatus
@@ -656,6 +706,28 @@ attemptLoop:
 	}
 	if lastErr == nil {
 		lastErr = ErrNoAvailableAccount
+	}
+	// 选号层 SelectionUnavailableError 原样上抛（含冷却/额度原因）。
+	var selectionFailure *SelectionUnavailableError
+	if errors.As(lastErr, &selectionFailure) {
+		record := auditBase
+		status, code := http.StatusServiceUnavailable, "upstream_unavailable"
+		switch selectionFailure.Reason {
+		case SelectionCooling, SelectionModelCooling, SelectionTeamRateLimit, SelectionQuotaExhausted:
+			status, code = http.StatusTooManyRequests, string(selectionFailure.Reason)
+		}
+		record.StatusCode = status
+		record.DurationMS = time.Since(startedAt).Milliseconds()
+		record.ErrorCode = code
+		record.Attempts = failureAttempts.snapshot()
+		record.CreatedAt = time.Now().UTC()
+		applyAuditEgress(&record, egressTrace, route.Provider)
+		persistCtx, cancel := context.WithTimeout(context.Background(), finalizationTimeout)
+		defer cancel()
+		if err := s.audits.Create(persistCtx, record); err != nil {
+			s.logger.Error("request_usage_write_failed", "event_id", record.EventID, "request_id", input.RequestID, "error", err)
+		}
+		return nil, selectionFailure
 	}
 	record := auditBase
 	record.StatusCode = http.StatusServiceUnavailable
