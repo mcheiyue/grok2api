@@ -10,7 +10,7 @@
 | 上游 | `https://github.com/chenyme/grok2api` |
 | 本地路径 | `D:\OpenCode\VPS\Grok改造\chen-fork\` |
 | W0 基线 tip | **`90ec921`**（同步 upstream/main，含 #636 一带） |
-| 本地 tip（含改造） | **`d301104`**（docs tip；业务 W2.5 `b40ad1a` WARP profile） |
+| 本地 tip（含改造） | **`325d7c5`+**（docs；业务 W2.5 `b40ad1a` WARP profile） |
 | 上游版本文件 | `VERSION` = `v3.0.0` |
 | 镜像（fork 推 main 后） | `ghcr.io/mcheiyue/grok2api:latest`（workflow 按 `GITHUB_REPOSITORY` 命名） |
 
@@ -85,11 +85,12 @@ pnpm build
 
 ## 与工作区文档
 
-- 现行规划：`../plans/chen-fork-改造规划.md`（v1.4）
+- 现行规划：`../plans/chen-fork-改造规划.md`（v1.5）
 - W3 运营：`../plans/W3-进度.md` 及 W3.1–W3.4 文档
+- W4 切流：`../plans/W4-进度.md`、`W4-切流准备.md`、`W4-客户端对接说明.md`
 - 工作区入口：`../README.md`
 - 旧 Gork 吸收史料：`../archive/gork-absorb-legacy/`（只读）
 
 ---
 
-*W0 建立 · W2/W3 文档同步 · 2026-07-15*
+*W0 建立 · W2/W3/W4 文档同步 · 2026-07-15*
