@@ -10,8 +10,9 @@
 | 上游 | `https://github.com/chenyme/grok2api` |
 | 本地路径 | `D:\OpenCode\VPS\Grok改造\chen-fork\` |
 | W0 基线 tip | **`90ec921`**（同步 upstream/main，含 #636 一带） |
-| 本地 tip（含改造） | **`325d7c5`+**（docs；业务 W2.5 `b40ad1a` WARP profile） |
-| 上游版本文件 | `VERSION` = `v3.0.0` |
+| 本地 tip（含改造） | **`1e1d36b`**（merge upstream ~50 commits + 保留 Console team 熔断） |
+| 业务有效 tip | **`1e1d36b`**；生产镜像 digest 见 `plans/W4-merge上游-升级-20260717.md` |
+| 上游版本文件 | 以仓库 `VERSION` 为准（merge 后已对齐上游） |
 | 镜像（fork 推 main 后） | `ghcr.io/mcheiyue/grok2api:latest`（workflow 按 `GITHUB_REPOSITORY` 命名） |
 
 能力源（非上游）：`../Gork/`（mcheiyue/Gork，Console/防封/选号）。
