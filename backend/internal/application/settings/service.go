@@ -251,7 +251,10 @@ func (s *Service) ReloadPersisted(ctx context.Context) error {
 }
 
 func applyDomainConfig(base config.Config, value settingsdomain.Config) config.Config {
-	base.Server.MaxConcurrentRequests = value.Server.MaxConcurrentRequests
+	// 旧版运行设置没有 Server 字段，反序列化后为零；升级时沿用当前配置默认值。
+	if value.Server.MaxConcurrentRequests > 0 {
+		base.Server.MaxConcurrentRequests = value.Server.MaxConcurrentRequests
+	}
 	capacityWait := value.Routing.CapacityWait
 	if capacityWait <= 0 {
 		capacityWait = base.Routing.CapacityWait.Value()
@@ -269,13 +272,16 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		MediaConcurrency: value.ProviderWeb.MediaConcurrency, AllowNSFW: value.ProviderWeb.AllowNSFW,
 		RecoveryBackoffBase: config.Duration(value.ProviderWeb.RecoveryBackoffBase), RecoveryBackoffMax: config.Duration(value.ProviderWeb.RecoveryBackoffMax),
 	}
+	// Console 是后续版本新增的完整配置段；旧 JSON 整段缺失时沿用代码默认值。
 	// Team 熔断秒数目前仅 YAML/默认值可配，Admin 热更不覆盖。
-	base.Provider.Console = config.ConsoleProviderConfig{
-		BaseURL: value.ProviderConsole.BaseURL, UserAgent: value.ProviderConsole.UserAgent,
-		ChatTimeout:            config.Duration(value.ProviderConsole.ChatTimeout),
-		TeamRPMCooldownSec:     base.Provider.Console.TeamRPMCooldownSec,
-		TeamRPSCooldownSec:     base.Provider.Console.TeamRPSCooldownSec,
-		TeamUnknownCooldownSec: base.Provider.Console.TeamUnknownCooldownSec,
+	if value.ProviderConsole != (settingsdomain.ProviderConsoleConfig{}) {
+		base.Provider.Console = config.ConsoleProviderConfig{
+			BaseURL: value.ProviderConsole.BaseURL, UserAgent: value.ProviderConsole.UserAgent,
+			ChatTimeout:            config.Duration(value.ProviderConsole.ChatTimeout),
+			TeamRPMCooldownSec:     base.Provider.Console.TeamRPMCooldownSec,
+			TeamRPSCooldownSec:     base.Provider.Console.TeamRPSCooldownSec,
+			TeamUnknownCooldownSec: base.Provider.Console.TeamUnknownCooldownSec,
+		}
 	}
 	randomDelay := time.Duration(-1)
 	if value.Batch.RandomDelay != nil {
