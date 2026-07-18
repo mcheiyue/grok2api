@@ -21,8 +21,8 @@ const (
 	StatsigModeManual             = "manual"
 	StatsigModeURL                = "url"
 	DefaultStatsigSignerURL       = "https://grok.wodf.de/sign"
-	RecommendedBuildClientVersion = "0.2.101"
-	RecommendedBuildUserAgent     = "grok-shell/0.2.101 (linux; x86_64)"
+	RecommendedBuildClientVersion = "0.2.102"
+	RecommendedBuildUserAgent     = "grok-shell/0.2.102 (linux; x86_64)"
 
 	maxServerBodyBytes    = 256 << 20
 	maxRequestTimeout     = 24 * time.Hour
@@ -123,11 +123,15 @@ type ProviderConfig struct {
 
 type BuildProviderConfig struct {
 	BaseURL          string `yaml:"baseURL"`
+	FallbackBaseURL  string `yaml:"fallbackBaseURL"`
 	ClientVersion    string `yaml:"clientVersion"`
 	ClientIdentifier string `yaml:"clientIdentifier"`
 	TokenAuth        string `yaml:"tokenAuth"`
 	UserAgent        string `yaml:"userAgent"`
 }
+
+// DefaultBuildFallbackBaseURL 是主 Build API 对可回退推理操作 403 时探测的 XAI API 根地址。
+const DefaultBuildFallbackBaseURL = "https://api.x.ai/v1"
 
 type WebProviderConfig struct {
 	BaseURL             string   `yaml:"baseURL"`
@@ -145,9 +149,9 @@ type WebProviderConfig struct {
 }
 
 type ConsoleProviderConfig struct {
-	BaseURL     string   `yaml:"baseURL"`
-	UserAgent   string   `yaml:"userAgent"`
-	ChatTimeout Duration `yaml:"chatTimeout"`
+	BaseURL         string   `yaml:"baseURL"`
+	LegacyUserAgent string   `yaml:"userAgent"` // Deprecated: 仅用于兼容旧配置文件，不参与请求。
+	ChatTimeout     Duration `yaml:"chatTimeout"`
 	// Team 熔断秒数（W2.2/W2.3）：RPM/RPS/unknown；0 表示用默认 75/3/5。
 	TeamRPMCooldownSec     int `yaml:"teamRPMCooldownSec"`
 	TeamRPSCooldownSec     int `yaml:"teamRPSCooldownSec"`
@@ -177,11 +181,15 @@ type LocalMediaConfig struct {
 }
 
 type RoutingConfig struct {
-	StickyTTL    Duration `yaml:"stickyTTL"`
-	CooldownBase Duration `yaml:"cooldownBase"`
-	CooldownMax  Duration `yaml:"cooldownMax"`
-	CapacityWait Duration `yaml:"capacityWait"`
-	MaxAttempts  int      `yaml:"maxAttempts"`
+	StickyTTL                 Duration `yaml:"stickyTTL"`
+	CooldownBase              Duration `yaml:"cooldownBase"`
+	CooldownMax               Duration `yaml:"cooldownMax"`
+	CapacityWait              Duration `yaml:"capacityWait"`
+	MaxAttempts               int      `yaml:"maxAttempts"`
+	PreferFreeBuild           bool     `yaml:"preferFreeBuild"`
+	ReasoningReplayEnabled    bool     `yaml:"reasoningReplayEnabled"`
+	ReasoningReplayTTL        Duration `yaml:"reasoningReplayTTL"`
+	ReasoningReplayMaxEntries int      `yaml:"reasoningReplayMaxEntries"`
 }
 
 type AuditConfig struct {
@@ -385,9 +393,15 @@ func (c Config) Validate() error {
 	if c.Auth.AccessTokenTTL.Value() <= 0 || c.Auth.RefreshTokenTTL.Value() <= 0 {
 		return errors.New("JWT 有效期必须大于零")
 	}
-	providerURL, err := url.ParseRequestURI(strings.TrimSpace(c.Provider.Build.BaseURL))
-	if err != nil || providerURL.Scheme == "" || providerURL.Host == "" {
-		return errors.New("provider.build.baseURL 必须是有效 URL")
+	if err := validateAPIBaseURL("provider.build.baseURL", c.Provider.Build.BaseURL, false); err != nil {
+		return err
+	}
+	fallbackBase := strings.TrimSpace(c.Provider.Build.FallbackBaseURL)
+	if fallbackBase == "" {
+		fallbackBase = DefaultBuildFallbackBaseURL
+	}
+	if err := validateAPIBaseURL("provider.build.fallbackBaseURL", fallbackBase, true); err != nil {
+		return err
 	}
 	if strings.TrimSpace(c.Provider.Build.ClientVersion) == "" || strings.TrimSpace(c.Provider.Build.ClientIdentifier) == "" || strings.TrimSpace(c.Provider.Build.TokenAuth) == "" || strings.TrimSpace(c.Provider.Build.UserAgent) == "" {
 		return errors.New("provider.build 客户端标识不能为空")
@@ -421,9 +435,6 @@ func (c Config) Validate() error {
 	if err != nil || consoleURL.Scheme != "https" || consoleURL.Host == "" || consoleURL.User != nil {
 		return errors.New("provider.console.baseURL 必须是无凭据的 HTTPS URL")
 	}
-	if userAgent := strings.TrimSpace(c.Provider.Console.UserAgent); len(userAgent) < 1 || len(userAgent) > 512 {
-		return errors.New("provider.console.userAgent 长度必须在 1 到 512 个字符之间")
-	}
 	if c.Provider.Console.ChatTimeout.Value() < 5*time.Second || c.Provider.Console.ChatTimeout.Value() > 30*time.Minute {
 		return errors.New("provider.console.chatTimeout 必须在 5 秒到 30 分钟之间")
 	}
@@ -447,6 +458,12 @@ func (c Config) Validate() error {
 	if c.Routing.StickyTTL.Value() <= 0 || c.Routing.StickyTTL.Value() > maxRoutingTTL || c.Routing.CooldownBase.Value() <= 0 || c.Routing.CooldownMax.Value() < c.Routing.CooldownBase.Value() || c.Routing.CooldownMax.Value() > maxRoutingCooldown || c.Routing.CapacityWait.Value() <= 0 || c.Routing.CapacityWait.Value() > 5*time.Second || c.Routing.MaxAttempts < 1 || c.Routing.MaxAttempts > 10 {
 		return errors.New("routing 配置无效")
 	}
+	if c.Routing.ReasoningReplayTTL.Value() <= 0 || c.Routing.ReasoningReplayTTL.Value() > 24*time.Hour {
+		return errors.New("routing.reasoningReplayTTL 必须在 1 纳秒到 24 小时之间")
+	}
+	if c.Routing.ReasoningReplayMaxEntries < 100 || c.Routing.ReasoningReplayMaxEntries > 1000000 {
+		return errors.New("routing.reasoningReplayMaxEntries 必须在 100 到 1000000 之间")
+	}
 	if c.Audit.BufferSize < 1 || c.Audit.BufferSize > maxAuditBufferSize || c.Audit.BatchSize < 1 || c.Audit.BatchSize > maxAuditBatchSize || c.Audit.BatchSize > c.Audit.BufferSize || c.Audit.FlushInterval.Value() < minAuditFlushInterval || c.Audit.FlushInterval.Value() > maxAuditFlushInterval {
 		return errors.New("audit 队列和批量写入配置无效")
 	}
@@ -454,6 +471,34 @@ func (c Config) Validate() error {
 		return errors.New("clientKeyDefaults 超出允许范围")
 	}
 	return nil
+}
+
+// validateAPIBaseURL 仅允许无凭据、query、fragment 的 HTTP(S) API 根地址。
+// requireHTTPS 为 true 时强制 HTTPS（用于生产默认 XAI 备用地址）。
+func validateAPIBaseURL(name, raw string, requireHTTPS bool) error {
+	parsed, err := url.ParseRequestURI(strings.TrimSpace(raw))
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("%s 必须是不含凭据、查询参数和片段的 HTTP(S) URL", name)
+	}
+	switch parsed.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if requireHTTPS {
+			return fmt.Errorf("%s 必须是 HTTPS URL", name)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%s 必须是不含凭据、查询参数和片段的 HTTP(S) URL", name)
+	}
+}
+
+// NormalizeBuildFallbackBaseURL 在旧配置缺字段时填入默认 XAI 备用地址。
+func NormalizeBuildFallbackBaseURL(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return DefaultBuildFallbackBaseURL
+	}
+	return strings.TrimSpace(value)
 }
 
 func defaultConfig() Config {
@@ -481,8 +526,8 @@ func defaultConfig() Config {
 		},
 		Provider: ProviderConfig{
 			Build: BuildProviderConfig{
-				BaseURL: "https://cli-chat-proxy.grok.com/v1", ClientVersion: RecommendedBuildClientVersion,
-				ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli",
+				BaseURL: "https://cli-chat-proxy.grok.com/v1", FallbackBaseURL: DefaultBuildFallbackBaseURL,
+				ClientVersion: RecommendedBuildClientVersion, ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli",
 				UserAgent: RecommendedBuildUserAgent,
 			},
 			Web: WebProviderConfig{
@@ -493,12 +538,9 @@ func defaultConfig() Config {
 				MediaConcurrency: 4, RecoveryBackoffBase: Duration(30 * time.Second),
 				RecoveryBackoffMax: Duration(30 * time.Minute),
 			},
-			Console: ConsoleProviderConfig{
-				BaseURL: "https://console.x.ai", UserAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-				ChatTimeout:            Duration(5 * time.Minute),
-				TeamRPMCooldownSec:     75,
-				TeamRPSCooldownSec:     3,
-				TeamUnknownCooldownSec: 5,
+Console: ConsoleProviderConfig{
+				BaseURL: "https://console.x.ai", ChatTimeout: Duration(5 * time.Minute),
+				TeamRPMCooldownSec: 75, TeamRPSCooldownSec: 3, TeamUnknownCooldownSec: 5,
 			},
 		},
 		Batch: BatchConfig{
@@ -511,11 +553,15 @@ func defaultConfig() Config {
 			Local: LocalMediaConfig{Path: "./data/media"},
 		},
 		Routing: RoutingConfig{
-			StickyTTL:    Duration(time.Hour),
-			CooldownBase: Duration(30 * time.Second),
-			CooldownMax:  Duration(30 * time.Minute),
-			CapacityWait: Duration(500 * time.Millisecond),
-			MaxAttempts:  3,
+			StickyTTL:                 Duration(time.Hour),
+			CooldownBase:              Duration(30 * time.Second),
+			CooldownMax:               Duration(30 * time.Minute),
+			CapacityWait:              Duration(500 * time.Millisecond),
+			MaxAttempts:               3,
+			PreferFreeBuild:           false,
+			ReasoningReplayEnabled:    true,
+			ReasoningReplayTTL:        Duration(time.Hour),
+			ReasoningReplayMaxEntries: 10240,
 		},
 		Audit:             AuditConfig{BufferSize: 16384, BatchSize: 256, FlushInterval: Duration(250 * time.Millisecond)},
 		ClientKeyDefaults: ClientKeyDefaultsConfig{RPMLimit: clientkeydomain.DefaultRPMLimit, MaxConcurrent: clientkeydomain.DefaultMaxConcurrent},

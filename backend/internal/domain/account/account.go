@@ -3,6 +3,7 @@ package account
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"strings"
 	"time"
 )
 
@@ -62,6 +63,24 @@ const (
 	WebTierHeavy WebTier = "heavy"
 )
 
+// BuildRouteMode 控制 Build 账号的推理地址；模型、Billing 与 OAuth 不受影响。
+type BuildRouteMode string
+
+const (
+	BuildRouteAuto  BuildRouteMode = "auto"
+	BuildRouteBuild BuildRouteMode = "build"
+	BuildRouteXAI   BuildRouteMode = "xai"
+)
+
+func (m BuildRouteMode) IsValid() bool {
+	switch m {
+	case BuildRouteAuto, BuildRouteBuild, BuildRouteXAI:
+		return true
+	default:
+		return false
+	}
+}
+
 const (
 	DefaultPriority         = 1
 	DefaultMaxConcurrent    = 8
@@ -113,8 +132,19 @@ type Credential struct {
 	LinkedAccountID           uint64
 	LinkedAccountName         string
 	LinkedProvider            Provider
-	CreatedAt                 time.Time
-	UpdatedAt                 time.Time
+	// BuildAPIFallback 仅记录 grok_build 曾因当次 Build 403 成功回退到 XAI。
+	// 它不参与路由；每个新请求仍先走 Build，只有当次严格 403 才可尝试 XAI。
+	// token refresh / SSO 转换 / 普通 upsert / 重启不得清除。
+	BuildAPIFallback bool
+	// BuildRouteMode 是管理员设置的账号级推理地址策略。
+	// auto 使用 bot flag / Build 403 自动规则；build 与 xai 分别强制单一地址。
+	BuildRouteMode BuildRouteMode
+	// BuildSuperEntitled 仅对 grok_build 有效：管理员已确认该账号具备 Super/1.5 entitlement。
+	// 不替代 Billing 快照，不等同于 BuildAPIFallback，也不表示请求应走 XAI。
+	// 普通导入/upsert/token refresh/SSO 转换不得清除；仅显式管理员 PATCH 可改。
+	BuildSuperEntitled bool
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 // CredentialRefreshDueAt 将账号稳定地分散到到期前 5~8 分钟，避免同批导入账号同时刷新。
@@ -300,6 +330,78 @@ func (b Billing) Remaining() float64 {
 		return 0
 	}
 	return remaining
+}
+
+// IsPaid 判断 Billing 快照是否呈现 Super/paid 信号。
+// 语义与 SQL accountPaidBillingPredicate 及 QuotaView paid 分支一致：
+// 已确认的付费订阅名称，或任一付费额度字段为正，即为 paid。
+// creditUsagePercent 只是当前周期使用率，Free 与 paid 都可能存在，不能参与判级。
+// 无快照时应由调用方按 Unknown 处理，不得调用本方法。
+// 注意：零 Billing + 管理员确认的 BuildSuperEntitled 由 IsBuildSuper 统一判定，不经本方法。
+func (b Billing) IsPaid() bool {
+	return isPaidBillingPlan(b.PlanCode) || isPaidBillingPlan(b.PlanName) ||
+		b.MonthlyLimit > 0 || b.OnDemandCap > 0 || b.OnDemandUsed > 0 || b.PrepaidBalance > 0
+}
+
+// HasFreeProfileSignal 仅接受明确的 Free/Basic 套餐名称。
+// currentPeriod、unified billing、top-up 等字段在零使用量的付费账号上同样存在，
+// 不能作为 Free 证据，否则会把刚开通的 SuperGrok 误判为 Free。
+func (b Billing) HasFreeProfileSignal() bool {
+	return isFreeBillingPlan(b.PlanCode) || isFreeBillingPlan(b.PlanName)
+}
+
+func normalizeBillingPlan(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	return strings.NewReplacer(" ", "", "_", "", "-", "", "+", "plus").Replace(value)
+}
+
+func isPaidBillingPlan(value string) bool {
+	switch normalizeBillingPlan(value) {
+	case "super", "supergrok", "supergrokpro", "supergrokheavy", "supergroklite",
+		"grokpro", "xpremium", "xpremiumplus", "apikey":
+		return true
+	default:
+		return false
+	}
+}
+
+func isFreeBillingPlan(value string) bool {
+	switch normalizeBillingPlan(value) {
+	case "free", "grokfree", "freetier", "basic", "grokbasic", "xbasic":
+		return true
+	default:
+		return false
+	}
+}
+
+// IsBuildSuper 判定 Grok Build 账号是否为 Super：Billing IsPaid 或管理员确认 BuildSuperEntitled。
+// 非 Build Provider 恒为 false。与 SQL accountBuildSuperPredicate 语义一致。
+func IsBuildSuper(credential Credential, billing *Billing) bool {
+	if credential.Provider != ProviderBuild {
+		return false
+	}
+	if credential.BuildSuperEntitled {
+		return true
+	}
+	return billing != nil && billing.IsPaid()
+}
+
+// IsKnownFreeBuild 判断候选是否是已确认的 Grok Build Free 账号。
+// Super（Billing paid 或 BuildSuperEntitled）优先，避免旧的响应模型或恢复记录把 Super 错分为 Free。
+func (c RoutingCandidate) IsKnownFreeBuild() bool {
+	if c.Credential.Provider != ProviderBuild {
+		return false
+	}
+	if IsBuildSuper(c.Credential, c.Billing) {
+		return false
+	}
+	if c.QuotaRecovery != nil && c.QuotaRecovery.Kind == QuotaRecoveryKindFree {
+		return true
+	}
+	if strings.HasSuffix(strings.ToLower(strings.TrimSpace(c.Credential.ObservedModel)), "-build-free") {
+		return true
+	}
+	return c.Billing != nil && c.Billing.HasFreeProfileSignal()
 }
 
 // IsExhausted 判断额度快照是否已达到账号保留阈值。
