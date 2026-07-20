@@ -141,12 +141,18 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/accounts/console/import", h.importConsoleAuth)
 	router.POST("/accounts/web/convert-to-build", h.convertWebToBuild)
 	router.POST("/accounts/web/sync-to-console", h.syncWebToConsole)
+	router.POST("/accounts/web/run-scripts", h.runWebAccountScripts)
 	router.POST("/accounts/web/refresh-quotas", h.refreshAllWebQuotas)
+	router.POST("/accounts/web/:id/accept-terms", h.acceptWebTerms)
+	router.POST("/accounts/web/:id/birth-date", h.setWebBirthDate)
+	router.POST("/accounts/web/:id/nsfw", h.enableWebNSFW)
 	router.POST("/accounts/console/refresh-quotas", h.refreshAllConsoleQuotas)
 	router.POST("/accounts/refresh-billing", h.refreshAllBilling)
 	router.POST("/accounts/refresh-tokens", h.refreshAllTokens)
+	router.POST("/accounts/cleanup", h.cleanup)
 	router.POST("/accounts/batch/refresh-billing", h.batchRefreshBilling)
 	router.POST("/accounts/batch/refresh-quotas", h.batchRefreshQuotas)
+	router.POST("/accounts/batch/refresh-tokens", h.batchRefreshTokens)
 	router.PATCH("/accounts/batch", h.batchUpdate)
 	router.DELETE("/accounts", h.batchDelete)
 	router.PATCH("/accounts/:id", h.update)
@@ -180,6 +186,11 @@ type batchUpdateRequest struct {
 type batchDeleteRequest struct {
 	IDs      []string `json:"ids" binding:"required"`
 	Provider string   `json:"provider" binding:"required"`
+}
+
+type accountCleanupRequest struct {
+	Provider string                     `json:"provider" binding:"required"`
+	Statuses []accountapp.CleanupStatus `json:"statuses" binding:"required"`
 }
 
 type buildConversionRequest struct {
@@ -229,44 +240,55 @@ type accountImportResponse struct {
 }
 
 type accountResponse struct {
-	ID                         uint64                `json:"id,string"`
-	Provider                   string                `json:"provider"`
-	AuthType                   string                `json:"authType"`
-	WebTier                    string                `json:"webTier,omitempty"`
-	WebTierSyncedAt            *time.Time            `json:"webTierSyncedAt,omitempty"`
-	Name                       string                `json:"name"`
-	Email                      string                `json:"email,omitempty"`
-	UserID                     string                `json:"userId,omitempty"`
-	TeamID                     string                `json:"teamId,omitempty"`
-	Enabled                    bool                  `json:"enabled"`
-	AuthStatus                 string                `json:"authStatus"`
-	ExpiresAt                  *time.Time            `json:"expiresAt,omitempty"`
-	Refreshable                bool                  `json:"refreshable"`
-	RefreshDueAt               *time.Time            `json:"refreshDueAt,omitempty"`
-	LastRefreshAt              *time.Time            `json:"lastRefreshAt,omitempty"`
-	RefreshFailures            int                   `json:"refreshFailureCount"`
-	LastRefreshError           string                `json:"lastRefreshErrorCode,omitempty"`
-	Priority                   int                   `json:"priority"`
-	MaxConcurrent              int                   `json:"maxConcurrent"`
-	MinimumRemaining           float64               `json:"minimumRemaining"`
-	FailureCount               int                   `json:"failureCount"`
-	CooldownUntil              *time.Time            `json:"cooldownUntil,omitempty"`
-	LastError                  string                `json:"lastError,omitempty"`
-	LastUsedAt                 *time.Time            `json:"lastUsedAt,omitempty"`
-	LinkedAccountID            uint64                `json:"linkedAccountId,omitempty,string"`
-	LinkedName                 string                `json:"linkedAccountName,omitempty"`
-	LinkedProvider             string                `json:"linkedProvider,omitempty"`
-	CreatedAt                  time.Time             `json:"createdAt"`
-	ObservedModel              string                `json:"observedModel,omitempty"`
-	ObservedModelAt            *time.Time            `json:"observedModelAt,omitempty"`
-	CloudflareCookieConfigured bool                  `json:"cloudflareCookieConfigured"`
-	BuildSuperEntitled         bool                  `json:"buildSuperEntitled"`
-	BuildRouteMode             string                `json:"buildRouteMode"`
-	BuildBotFlagged            bool                  `json:"buildBotFlagged"`
-	ModelSyncFailed            bool                  `json:"modelSyncFailed,omitempty"`
-	Billing                    *billingResponse      `json:"billing,omitempty"`
-	Quota                      quotaResponse         `json:"quota"`
-	QuotaWindows               []quotaWindowResponse `json:"quotaWindows,omitempty"`
+	ID                         uint64                  `json:"id,string"`
+	Provider                   string                  `json:"provider"`
+	AuthType                   string                  `json:"authType"`
+	WebTier                    string                  `json:"webTier,omitempty"`
+	WebTierSyncedAt            *time.Time              `json:"webTierSyncedAt,omitempty"`
+	WebNSFWEnabledAt           *time.Time              `json:"nsfwEnabledAt,omitempty"`
+	WebTermsAcceptedAt         *time.Time              `json:"termsAcceptedAt,omitempty"`
+	Name                       string                  `json:"name"`
+	Email                      string                  `json:"email,omitempty"`
+	UserID                     string                  `json:"userId,omitempty"`
+	TeamID                     string                  `json:"teamId,omitempty"`
+	Enabled                    bool                    `json:"enabled"`
+	AuthStatus                 string                  `json:"authStatus"`
+	ExpiresAt                  *time.Time              `json:"expiresAt,omitempty"`
+	Refreshable                bool                    `json:"refreshable"`
+	RefreshDueAt               *time.Time              `json:"refreshDueAt,omitempty"`
+	LastRefreshAt              *time.Time              `json:"lastRefreshAt,omitempty"`
+	RefreshFailures            int                     `json:"refreshFailureCount"`
+	LastRefreshError           string                  `json:"lastRefreshErrorCode,omitempty"`
+	Priority                   int                     `json:"priority"`
+	MaxConcurrent              int                     `json:"maxConcurrent"`
+	MinimumRemaining           float64                 `json:"minimumRemaining"`
+	FailureCount               int                     `json:"failureCount"`
+	CooldownUntil              *time.Time              `json:"cooldownUntil,omitempty"`
+	LastError                  string                  `json:"lastError,omitempty"`
+	LastUsedAt                 *time.Time              `json:"lastUsedAt,omitempty"`
+	LinkedAccountID            uint64                  `json:"linkedAccountId,omitempty,string"`
+	LinkedName                 string                  `json:"linkedAccountName,omitempty"`
+	LinkedProvider             string                  `json:"linkedProvider,omitempty"`
+	LinkedAccounts             []linkedAccountResponse `json:"linkedAccounts,omitempty"`
+	CreatedAt                  time.Time               `json:"createdAt"`
+	ObservedModel              string                  `json:"observedModel,omitempty"`
+	ObservedModelAt            *time.Time              `json:"observedModelAt,omitempty"`
+	CloudflareCookieConfigured bool                    `json:"cloudflareCookieConfigured"`
+	BuildSuperEntitled         bool                    `json:"buildSuperEntitled"`
+	BuildRouteMode             string                  `json:"buildRouteMode"`
+	BuildBotFlagged            bool                    `json:"buildBotFlagged"`
+	ModelSyncFailed            bool                    `json:"modelSyncFailed,omitempty"`
+	Billing                    *billingResponse        `json:"billing,omitempty"`
+	Quota                      quotaResponse           `json:"quota"`
+	QuotaWindows               []quotaWindowResponse   `json:"quotaWindows,omitempty"`
+}
+
+type linkedAccountResponse struct {
+	ID       uint64 `json:"id,string"`
+	Provider string `json:"provider"`
+	Name     string `json:"name"`
+	Email    string `json:"email,omitempty"`
+	UserID   string `json:"userId,omitempty"`
 }
 
 type quotaWindowResponse struct {
@@ -449,6 +471,20 @@ func (h *Handler) batchRefreshBilling(c *gin.Context) {
 	response.Success(c, http.StatusOK, gin.H{"succeeded": succeeded, "failed": failed})
 }
 
+func (h *Handler) cleanup(c *gin.Context) {
+	var request accountCleanupRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	deleted, err := h.service.CleanupAccounts(c.Request.Context(), accountdomain.Provider(request.Provider), request.Statuses)
+	if err != nil {
+		h.writeServiceError(c, "accountCleanupFailed", err, http.StatusInternalServerError, "清理账号失败")
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"deleted": deleted})
+}
+
 func (h *Handler) batchRefreshQuotas(c *gin.Context) {
 	var request batchDeleteRequest
 	if c.ShouldBindJSON(&request) != nil {
@@ -479,6 +515,32 @@ func (h *Handler) batchRefreshQuotas(c *gin.Context) {
 		return
 	}
 	response.Success(c, http.StatusOK, gin.H{"succeeded": succeeded, "failed": failed})
+}
+
+func (h *Handler) batchRefreshTokens(c *gin.Context) {
+	var request batchDeleteRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	ids, err := parseIDs(request.IDs)
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidId", err.Error())
+		return
+	}
+	if request.Provider != string(accountdomain.ProviderBuild) {
+		response.Error(c, http.StatusBadRequest, "invalidProvider", "仅 Grok Build 账号支持凭据刷新")
+		return
+	}
+	if !h.validateProviderIDs(c, ids, request.Provider) {
+		return
+	}
+	succeeded, failed, skipped, err := h.service.BatchRefreshTokens(c.Request.Context(), ids)
+	if err != nil {
+		h.writeServiceError(c, "tokenRefreshFailed", err, http.StatusBadGateway, "批量刷新账号凭据失败")
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"succeeded": succeeded, "failed": failed, "skipped": skipped})
 }
 
 func (h *Handler) get(c *gin.Context) {
@@ -879,12 +941,13 @@ func (h *Handler) refreshWebQuota(c *gin.Context) {
 }
 
 func (h *Handler) exportCredentials(c *gin.Context) {
-	result, err := h.service.ExportCredentials(c.Request.Context())
+	providerValue := accountdomain.Provider(c.DefaultQuery("provider", string(accountdomain.ProviderBuild)))
+	result, err := h.service.ExportProviderCredentials(c.Request.Context(), providerValue)
 	if err != nil {
 		h.writeServiceError(c, "accountExportFailed", err, http.StatusInternalServerError, "导出账号失败")
 		return
 	}
-	filename := "grok2api-accounts-" + time.Now().UTC().Format("20060102T150405Z") + ".json"
+	filename := "grok2api-" + string(providerValue) + "-accounts-" + time.Now().UTC().Format("20060102T150405Z") + ".json"
 	c.Header("Cache-Control", "no-store")
 	c.Header("Pragma", "no-cache")
 	c.Header("Content-Disposition", `attachment; filename="`+filename+`"`)
@@ -950,12 +1013,16 @@ func (h *Handler) writeServiceError(c *gin.Context, code string, err error, fall
 		response.Error(c, http.StatusBadRequest, "accountExportLimitExceeded", err.Error())
 	case errors.Is(err, accountapp.ErrInvalidInput), errors.Is(err, accountapp.ErrInvalidImport):
 		response.Error(c, http.StatusBadRequest, code, err.Error())
+	case errors.Is(err, accountapp.ErrConflict):
+		response.Error(c, http.StatusConflict, code, err.Error())
 	case errors.Is(err, accountapp.ErrNotFound):
 		response.Error(c, http.StatusNotFound, "accountNotFound", err.Error())
 	case errors.Is(err, accountapp.ErrUnsupported):
 		response.Error(c, http.StatusConflict, "accountOperationUnsupported", err.Error())
 	case errors.Is(err, accountapp.ErrConversionBusy):
 		response.Error(c, http.StatusConflict, "accountConversionBusy", err.Error())
+	case errors.Is(err, accountapp.ErrWebAccountScriptBusy):
+		response.Error(c, http.StatusConflict, "webAccountScriptBusy", err.Error())
 	default:
 		response.Error(c, fallbackStatus, code, fallbackMessage)
 	}
@@ -972,6 +1039,42 @@ func (h *Handler) refreshToken(c *gin.Context) {
 		return
 	}
 	response.Success(c, http.StatusOK, newAccountResponse(value))
+}
+
+func (h *Handler) acceptWebTerms(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	if err := h.service.AcceptWebTerms(c.Request.Context(), id); err != nil {
+		h.writeServiceError(c, "webTermsAcceptanceFailed", err, http.StatusBadGateway, "接受 Grok Web 服务协议失败")
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"completed": true})
+}
+
+func (h *Handler) setWebBirthDate(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	if err := h.service.SetWebBirthDate(c.Request.Context(), id); err != nil {
+		h.writeServiceError(c, "webBirthDateUpdateFailed", err, http.StatusBadGateway, "设置 Grok Web 账号生日失败")
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"completed": true})
+}
+
+func (h *Handler) enableWebNSFW(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	if err := h.service.EnableWebNSFW(c.Request.Context(), id); err != nil {
+		h.writeServiceError(c, "webNSFWEnableFailed", err, http.StatusBadGateway, "开启 Grok Web NSFW 失败")
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"completed": true})
 }
 
 func (h *Handler) refreshBilling(c *gin.Context) {
@@ -1039,7 +1142,7 @@ func newAccountResponse(value accountapp.View) accountResponse {
 	}
 	result := accountResponse{
 		ID: c.ID, Provider: string(c.Provider), AuthType: string(c.AuthType), WebTier: string(c.WebTier),
-		WebTierSyncedAt: c.WebTierSyncedAt, Name: c.Name, Email: c.Email, UserID: c.UserID, TeamID: c.TeamID,
+		WebTierSyncedAt: c.WebTierSyncedAt, WebNSFWEnabledAt: c.WebNSFWEnabledAt, WebTermsAcceptedAt: c.WebTermsAcceptedAt, Name: c.Name, Email: c.Email, UserID: c.UserID, TeamID: c.TeamID,
 		Enabled: c.Enabled, AuthStatus: string(c.AuthStatus), Refreshable: c.EncryptedRefreshToken != "",
 		RefreshDueAt: c.RefreshDueAt, LastRefreshAt: c.LastRefreshAt,
 		RefreshFailures: c.RefreshFailureCount, LastRefreshError: c.LastRefreshErrorCode,
@@ -1052,6 +1155,9 @@ func newAccountResponse(value accountapp.View) accountResponse {
 		BuildRouteMode:             string(buildRouteMode),
 		BuildBotFlagged:            value.BuildBotFlagged && c.Provider == accountdomain.ProviderBuild,
 		Quota:                      newQuotaResponse(value.Quota), QuotaWindows: make([]quotaWindowResponse, 0, len(value.QuotaWindows)),
+	}
+	for _, linked := range c.LinkedAccounts {
+		result.LinkedAccounts = append(result.LinkedAccounts, linkedAccountResponse{ID: linked.ID, Provider: string(linked.Provider), Name: linked.Name, Email: linked.Email, UserID: linked.UserID})
 	}
 	for _, window := range value.QuotaWindows {
 		breakdown := make([]quotaBreakdownResponse, 0, len(window.Breakdown))
@@ -1095,16 +1201,7 @@ func newBillingResponse(value accountdomain.Billing) billingResponse {
 func pagination(c *gin.Context) (int, int) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	size, _ := strconv.Atoi(c.DefaultQuery("pageSize", "20"))
-	if page < 1 {
-		page = 1
-	}
-	if size < 1 {
-		size = 20
-	}
-	if size > 100 {
-		size = 100
-	}
-	return page, size
+	return repository.NormalizePage(page, size, repository.DefaultPageSize)
 }
 
 func pathID(c *gin.Context) (uint64, bool) {
@@ -1129,16 +1226,19 @@ func parseIDs(values []string) ([]uint64, error) {
 }
 
 func (h *Handler) validateProviderIDs(c *gin.Context, ids []uint64, providerValue string) bool {
-	if providerValue != string(accountdomain.ProviderBuild) && providerValue != string(accountdomain.ProviderWeb) && providerValue != string(accountdomain.ProviderConsole) {
+	provider := accountdomain.Provider(providerValue)
+	if !provider.IsValid() {
 		response.Error(c, http.StatusBadRequest, "invalidProvider", "账号来源无效")
 		return false
 	}
-	for _, id := range ids {
-		value, err := h.service.Get(c.Request.Context(), id)
-		if err != nil || string(value.Credential.Provider) != providerValue {
-			response.Error(c, http.StatusConflict, "accountPoolMismatch", "批量操作包含不属于当前号池的账号")
-			return false
-		}
+	valid, err := h.service.AccountsBelongToProvider(c.Request.Context(), ids, provider)
+	if err != nil {
+		h.writeServiceError(c, "accountPoolValidationFailed", err, http.StatusInternalServerError, "校验账号号池失败")
+		return false
+	}
+	if !valid {
+		response.Error(c, http.StatusConflict, "accountPoolMismatch", "批量操作包含不属于当前号池的账号")
+		return false
 	}
 	return true
 }

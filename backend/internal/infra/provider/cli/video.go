@@ -29,13 +29,16 @@ const (
 )
 
 type videoRequestProfile struct {
-	model         string
-	imageURLField string
+	model            string
+	imageURLField    string
+	userAgentProduct string
 }
 
 var (
 	buildVideoRequestProfile = videoRequestProfile{model: buildVideoModel, imageURLField: "image_url"}
-	xaiVideoRequestProfile   = videoRequestProfile{model: xaiVideoModel, imageURLField: "url"}
+	// 官方 0.2.106 的直连 XAI 图片/视频工具使用 xai-grok-build/<version>，
+	// 与 cli-chat-proxy 采样请求的 grok-shell/<version> UA 不同。
+	xaiVideoRequestProfile = videoRequestProfile{model: xaiVideoModel, imageURLField: "url", userAgentProduct: "xai-grok-build"}
 )
 
 // mediaUploadSecretPattern 匹配上传路径及其中的 64-hex 一次性 token（含完整 URL 前缀）。
@@ -243,7 +246,7 @@ func (a *Adapter) DownloadVideo(ctx context.Context, credential account.Credenti
 	if err != nil || parsed.Scheme != "https" || parsed.User != nil || !trustedBuildVideoAssetHost(parsed.Hostname()) {
 		return nil, "", 0, fmt.Errorf("视频内容 URL 不受信任")
 	}
-	requestCtx := infraegress.WithAccount(ctx, string(account.ProviderBuild), credential.ID)
+	requestCtx := infraegress.WithCredential(ctx, credential)
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, parsed.String(), nil)
 	if err != nil {
 		return nil, "", 0, err
@@ -352,13 +355,19 @@ func (a *Adapter) doVideoJSON(ctx context.Context, credential account.Credential
 	if len(body) > 0 {
 		bodyReader = bytes.NewReader(body)
 	}
-	requestCtx := infraegress.WithAccount(ctx, string(account.ProviderBuild), credential.ID)
+	requestCtx := infraegress.WithCredential(ctx, credential)
 	req, err := http.NewRequestWithContext(requestCtx, method, a.urlWithBase(base, path), bodyReader)
 	if err != nil {
 		return nil, err
 	}
 	if err := a.applyHeaders(req, credential, accessToken, profile.model, "", withTrace); err != nil {
 		return nil, err
+	}
+	if profile.userAgentProduct != "" {
+		version := strings.TrimSpace(a.config().ClientVersion)
+		if version != "" {
+			req.Header.Set("User-Agent", profile.userAgentProduct+"/"+version)
+		}
 	}
 	if len(body) > 0 {
 		req.Header.Set("Content-Type", "application/json")

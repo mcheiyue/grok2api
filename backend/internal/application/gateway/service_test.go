@@ -124,7 +124,7 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	clientService := clientkeyapp.NewService(nil, nil, nil, 60, 4, nil)
 	selector := NewSelector(accountRepo, concurrency, sticky, registry, time.Hour, time.Second, time.Minute)
 	service := NewService(modelRepo, auditRepo, accountService, clientService, registry, selector, responseRepo, 3)
-	result, err := service.CreateResponse(ctx, Input{RequestID: "req-1", ClientKey: clientKey, PublicModel: "grok-test", Body: []byte(`{"model":"grok-test"}`), PromptCacheSeed: "claude-session"})
+	result, err := service.CreateResponse(ctx, Input{RequestID: "req-1", ClientKey: clientKey, PublicModel: "grok-test", Body: []byte(`{"model":"grok-test"}`), PromptCacheSeed: "claude-session", GrokTurnIndex: "3"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,10 +140,16 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	if len(adapter.attempts) != 2 || adapter.attempts[0] != first.ID || adapter.attempts[1] != second.ID {
 		t.Fatalf("attempts = %#v", adapter.attempts)
 	}
-	identity := resolveBuildSessionIdentity(clientKey.ID, account.ProviderBuild, "grok-test", "", "claude-session")
+	identity := resolveBuildSessionIdentity(clientKey.ID, account.ProviderBuild, "grok-test", "", "claude-session", nil)
 	expectedCacheKey := identity.upstreamID
 	if adapter.lastPromptCacheKey != expectedCacheKey {
 		t.Fatalf("prompt cache key = %q, want %q", adapter.lastPromptCacheKey, expectedCacheKey)
+	}
+	if adapter.lastReasoningReplayKey != identity.replayKey {
+		t.Fatalf("reasoning replay key = %q, want %q", adapter.lastReasoningReplayKey, identity.replayKey)
+	}
+	if adapter.lastGrokTurnIndex != "3" {
+		t.Fatalf("Grok turn index = %q, want 3", adapter.lastGrokTurnIndex)
 	}
 	if boundID, ok, err := sticky.Get(ctx, stickySessionKey(identity.affinityKey), time.Now().UTC()); err != nil || !ok || boundID != second.ID {
 		t.Fatalf("failover sticky binding = %d, %v, err = %v; want account %d", boundID, ok, err, second.ID)
@@ -161,8 +167,26 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 		t.Fatalf("audit detail = %#v, err = %v", detail, err)
 	}
 	ownership, err := responseRepo.Get(ctx, "resp-test", clientKey.ID, time.Now().UTC())
-	if err != nil || ownership.AccountID != second.ID {
+	if err != nil || ownership.AccountID != second.ID || ownership.PromptCacheKey != expectedCacheKey || ownership.ReasoningReplayKey != identity.replayKey {
 		t.Fatalf("ownership = %#v, err = %v", ownership, err)
+	}
+
+	compacted, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-compact", ClientKey: clientKey, PublicModel: "grok-test", PromptCacheSeed: "claude-session",
+		Body: []byte(`{"model":"grok-test","stream":true,"input":[{"role":"user","content":"continue"},{"type":"compaction_trigger"}]}`), Streaming: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(compacted.Body)
+	compacted.Finalize(Usage{}, "resp-compact", "")
+	_ = compacted.Body.Close()
+	logs, total, err = auditRepo.List(ctx, 0, 10)
+	if err != nil || total != 2 || logs[0].Operation != audit.OperationCompaction || !logs[0].Streaming {
+		t.Fatalf("compaction audit = %#v, total=%d, err=%v", logs, total, err)
+	}
+	if _, err := responseRepo.Get(ctx, "resp-compact", clientKey.ID, time.Now().UTC()); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("compaction response ownership err = %v", err)
 	}
 
 	adapter.resetAttempts()
@@ -175,6 +199,13 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	_ = continued.Body.Close()
 	if len(adapter.attempts) != 1 || adapter.attempts[0] != second.ID {
 		t.Fatalf("continued attempts = %#v", adapter.attempts)
+	}
+	if adapter.lastPromptCacheKey != expectedCacheKey || adapter.lastReasoningReplayKey != identity.replayKey {
+		t.Fatalf("continued session identity drifted: cache=%q replay=%q", adapter.lastPromptCacheKey, adapter.lastReasoningReplayKey)
+	}
+	nextOwnership, err := responseRepo.Get(ctx, "resp-next", clientKey.ID, time.Now().UTC())
+	if err != nil || nextOwnership.PromptCacheKey != expectedCacheKey || nextOwnership.ReasoningReplayKey != identity.replayKey {
+		t.Fatalf("continued ownership = %#v, err = %v", nextOwnership, err)
 	}
 
 	adapter.resetAttempts()
@@ -209,6 +240,134 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	missing.Finalize(Usage{}, "", "")
 	if _, err := responseRepo.Get(ctx, "resp-next", clientKey.ID, time.Now().UTC()); !errors.Is(err, repository.ErrNotFound) {
 		t.Fatalf("stale ownership err = %v", err)
+	}
+
+	adapter.resetAttempts()
+	streamFailed, err := service.CreateResponse(ctx, Input{RequestID: "req-stream-failed", ClientKey: clientKey, PublicModel: "grok-test", Body: []byte(`{"model":"grok-test"}`), PromptCacheSeed: "stream-failed-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(streamFailed.Body)
+	if streamFailed.RecordStreamFailure == nil {
+		t.Fatal("stream failure recorder is nil")
+	}
+	streamFailed.RecordStreamFailure(StreamFailureDiagnostic{Body: []byte(`{"type":"response.failed","error":{"message":"access_token=secret-token"}}`)})
+	streamFailed.Finalize(Usage{}, "", "upstream_stream_error")
+	_ = streamFailed.Body.Close()
+	logs, _, err = auditRepo.List(ctx, 0, 10)
+	if err != nil || len(logs) == 0 {
+		t.Fatalf("stream failure audits = %#v, err = %v", logs, err)
+	}
+	streamDetail, err := auditRepo.Get(ctx, logs[0].ID)
+	if err != nil || streamDetail.ErrorCode != "upstream_stream_error" || streamDetail.AttemptCount != 1 || len(streamDetail.Attempts) != 1 {
+		t.Fatalf("stream failure detail = %#v, err = %v", streamDetail, err)
+	}
+	streamAttempt := streamDetail.Attempts[0]
+	if streamAttempt.Stage != "response_stream" || streamAttempt.UpstreamStatusCode == nil || *streamAttempt.UpstreamStatusCode != http.StatusOK || string(streamAttempt.ResponseBody) != `{"type":"response.failed","error":{"message":"access_token=[REDACTED]"}}` {
+		t.Fatalf("stream failure attempt = %#v", streamAttempt)
+	}
+
+	adapter.resetAttempts()
+	interrupted, err := service.CreateResponse(ctx, Input{RequestID: "req-stream-cut", ClientKey: clientKey, PublicModel: "grok-test", Body: []byte(`{"model":"grok-test"}`), PromptCacheSeed: "other-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(interrupted.Body)
+	interrupted.Finalize(Usage{}, "", "upstream_stream_incomplete")
+	_ = interrupted.Body.Close()
+	if len(adapter.attempts) != 1 {
+		t.Fatalf("interrupted attempts = %#v", adapter.attempts)
+	}
+	interruptedAccount, err := accountRepo.Get(ctx, adapter.attempts[0])
+	if err != nil || interruptedAccount.FailureCount != 1 || interruptedAccount.CooldownUntil == nil {
+		t.Fatalf("interrupted account health = %#v, err=%v", interruptedAccount, err)
+	}
+}
+
+func TestGatewaySSOUnauthorizedMarksInvalidAndSwitchesAccount(t *testing.T) {
+	for _, providerValue := range []account.Provider{account.ProviderWeb, account.ProviderConsole} {
+		providerValue := providerValue
+		t.Run(string(providerValue), func(t *testing.T) {
+			ctx := context.Background()
+			database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "sso-401.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			if err := database.InitializeSchema(ctx); err != nil {
+				t.Fatal(err)
+			}
+			accountRepo := relational.NewAccountRepository(database)
+			modelRepo := relational.NewModelRepository(database)
+			auditRepo := relational.NewAuditRepository(database)
+			responseRepo := relational.NewResponseRepository(database)
+			keyRepo := relational.NewClientKeyRepository(database)
+			credentials := make([]account.Credential, 0, 2)
+			for index, name := range []string{"rejected", "healthy"} {
+				credential, _, createErr := accountRepo.UpsertByIdentity(ctx, account.Credential{
+					Provider: providerValue, AuthType: account.AuthTypeSSO, Name: name, SourceKey: string(providerValue) + "-" + name,
+					EncryptedAccessToken: "encrypted-" + name, Enabled: true, AuthStatus: account.AuthStatusActive,
+					Priority: 200 - index*100, MaxConcurrent: 1,
+				})
+				if createErr != nil {
+					t.Fatal(createErr)
+				}
+				credentials = append(credentials, credential)
+			}
+			modelName := "grok-sso-401"
+			if err := modelRepo.UpsertDiscovered(ctx, providerValue, []string{modelName}); err != nil {
+				t.Fatal(err)
+			}
+			for _, credential := range credentials {
+				if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{modelName}, time.Now().UTC()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			key, err := keyRepo.Create(ctx, clientkey.Key{
+				Name: "sso-401-key", Prefix: "sso-401", SecretHash: strings.Repeat("e", 64), EncryptedSecret: "encrypted-key",
+				Enabled: true, RPMLimit: 60, MaxConcurrent: 4,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			adapter := &ssoUnauthorizedAdapter{providerValue: providerValue, rejectedID: credentials[0].ID}
+			registry := provider.NewRegistry(adapter)
+			sticky := memory.NewStickyStore()
+			accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+			selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+			service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 2)
+
+			result, err := service.CreateResponse(ctx, Input{
+				RequestID: "req-sso-401", ClientKey: key, PublicModel: modelName,
+				Body: []byte(`{"model":"grok-sso-401","input":"hello"}`),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(result.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result.Finalize(Usage{}, "", "")
+			_ = result.Body.Close()
+			if string(body) != "ok" {
+				t.Fatalf("body = %q", body)
+			}
+			if attempts := adapter.Attempts(); len(attempts) != 2 || attempts[0] != credentials[0].ID || attempts[1] != credentials[1].ID {
+				t.Fatalf("attempts = %#v", attempts)
+			}
+			rejected, err := accountRepo.Get(ctx, credentials[0].ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rejected.AuthStatus != account.AuthStatusReauthRequired || !rejected.Enabled {
+				t.Fatalf("rejected account = %#v", rejected)
+			}
+			healthy, err := accountRepo.Get(ctx, credentials[1].ID)
+			if err != nil || healthy.AuthStatus != account.AuthStatusActive {
+				t.Fatalf("healthy account = %#v, err = %v", healthy, err)
+			}
+		})
 	}
 }
 
@@ -456,6 +615,69 @@ func TestGatewayDoesNotPersistStatelessConsoleResponses(t *testing.T) {
 	}
 	if _, err := responseRepo.Get(ctx, "resp-console-stale", key.ID, time.Now().UTC()); !errors.Is(err, repository.ErrNotFound) {
 		t.Fatalf("stale console ownership was not removed: %v", err)
+	}
+}
+
+func TestGatewayWebOwnershipDoesNotPersistRawPromptCacheKey(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "web-ownership.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+	credential, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "web", SourceKey: "web",
+		EncryptedAccessToken: "encrypted", Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const model = "grok-web-ownership"
+	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderWeb, []string{model}); err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{model}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	key, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "web-key", Prefix: "web-key", SecretHash: strings.Repeat("d", 64), EncryptedSecret: "encrypted",
+		Enabled: true, RPMLimit: 60, MaxConcurrent: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := webStoredResponseAdapter{}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 1)
+
+	rawKey := strings.Repeat("raw-session-", 16)
+	result, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-web-ownership", ClientKey: key, PublicModel: model, PromptCacheKey: rawKey,
+		Body: []byte(`{"model":"grok-web-ownership","input":"hello"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(result.Body)
+	result.Finalize(Usage{}, "resp-web-ownership", "")
+	_ = result.Body.Close()
+	ownership, err := responseRepo.Get(ctx, "resp-web-ownership", key.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ownership.AccountID != credential.ID || ownership.Provider != account.ProviderWeb || ownership.PromptCacheKey != "" || ownership.ReasoningReplayKey != "" {
+		t.Fatalf("web ownership = %#v", ownership)
 	}
 }
 
@@ -982,6 +1204,77 @@ func TestImageStreamPropagatesWithoutTouchingChatQuota(t *testing.T) {
 	}
 }
 
+func TestWebImageUnauthorizedMarksInvalidAndSwitchesAccount(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "web-image-401.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+	credentials := make([]account.Credential, 0, 2)
+	for index, name := range []string{"rejected-image", "healthy-image"} {
+		credential, _, createErr := accountRepo.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierSuper,
+			Name: name, SourceKey: name, EncryptedAccessToken: "encrypted-" + name,
+			Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 200 - index*100, MaxConcurrent: 1,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		credentials = append(credentials, credential)
+	}
+	now := time.Now().UTC()
+	if err := modelRepo.UpsertRoutes(ctx, []modeldomain.Route{{
+		PublicID: "grok-image-401", Provider: account.ProviderWeb, UpstreamModel: "grok-image-401",
+		Capability: modeldomain.CapabilityImage, Enabled: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, credential := range credentials {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-image-401"}, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "image-401-key", Prefix: "image-401", SecretHash: strings.Repeat("f", 64), EncryptedSecret: "encrypted-key",
+		Enabled: true, RPMLimit: 60, MaxConcurrent: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &webImageStreamAdapter{synced: make(chan string, 1), unauthorizedID: credentials[0].ID}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(keyRepo, nil, nil, 60, 4, nil), registry, selector, responseRepo, 2)
+
+	result, err := service.GenerateImage(ctx, ImageGenerationInput{
+		RequestID: "req-image-401", ClientKey: key, PublicModel: "grok-image-401", Prompt: "test", Count: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(result.Body)
+	result.Finalize(Usage{}, "", "")
+	_ = result.Body.Close()
+	if attempts := adapter.Attempts(); len(attempts) != 2 || attempts[0] != credentials[0].ID || attempts[1] != credentials[1].ID {
+		t.Fatalf("attempts = %#v", attempts)
+	}
+	rejected, err := accountRepo.Get(ctx, credentials[0].ID)
+	if err != nil || rejected.AuthStatus != account.AuthStatusReauthRequired || !rejected.Enabled {
+		t.Fatalf("rejected account = %#v, err = %v", rejected, err)
+	}
+}
+
 func TestSuccessfulWebChatRefreshesCurrentModeQuota(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "chat-quota-refresh.db"))
@@ -1092,13 +1385,44 @@ func runQuotaRefreshWorkers(t *testing.T, service *accountapp.Service) {
 }
 
 type failoverAdapter struct {
-	mu                 sync.Mutex
-	firstID            uint64
-	attempts           []uint64
-	lastMethod         string
-	lastPath           string
-	lastPromptCacheKey string
-	resourceStatus     int
+	mu                     sync.Mutex
+	firstID                uint64
+	attempts               []uint64
+	lastMethod             string
+	lastPath               string
+	lastPromptCacheKey     string
+	lastReasoningReplayKey string
+	lastGrokTurnIndex      string
+	resourceStatus         int
+}
+
+type ssoUnauthorizedAdapter struct {
+	mu            sync.Mutex
+	providerValue account.Provider
+	rejectedID    uint64
+	attempts      []uint64
+}
+
+func (a *ssoUnauthorizedAdapter) Provider() account.Provider { return a.providerValue }
+func (a *ssoUnauthorizedAdapter) Definition() provider.Definition {
+	return testConversationDefinition(a.providerValue)
+}
+func (a *ssoUnauthorizedAdapter) ForwardResponse(_ context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
+	a.mu.Lock()
+	a.attempts = append(a.attempts, request.Credential.ID)
+	a.mu.Unlock()
+	if request.Credential.ID == a.rejectedID {
+		return &provider.Response{
+			StatusCode: http.StatusUnauthorized, Status: "401 Unauthorized", Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(`{"error":{"code":"unauthorized","message":"credential rejected"}}`)),
+		}, nil
+	}
+	return &provider.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok"))}, nil
+}
+func (a *ssoUnauthorizedAdapter) Attempts() []uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]uint64(nil), a.attempts...)
 }
 
 type statelessConsoleAdapter struct{}
@@ -1223,16 +1547,36 @@ func (a *systemicForbiddenAdapter) Attempts() []uint64 {
 	return append([]uint64(nil), a.attempts...)
 }
 
+type webStoredResponseAdapter struct{}
+
+func (webStoredResponseAdapter) Provider() account.Provider { return account.ProviderWeb }
+func (webStoredResponseAdapter) Definition() provider.Definition {
+	return provider.Definition{
+		Provider: account.ProviderWeb,
+		Conversation: provider.ConversationSurface{
+			Responses: true, StoredResponses: true,
+		},
+		Inference: provider.InferencePolicy{Usage: provider.UsageEstimated},
+	}
+}
+func (webStoredResponseAdapter) ForwardResponse(context.Context, provider.ResponseResourceRequest) (*provider.Response, error) {
+	return &provider.Response{
+		StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+		Body: io.NopCloser(strings.NewReader(`{"id":"resp-web-ownership"}`)),
+	}, nil
+}
+
 type webRateLimitAdapter struct{}
 
 type webImageStreamAdapter struct {
-	mu            sync.Mutex
-	streaming     bool
-	partialImages int
-	editRequest   provider.ImageEditRequest
-	synced        chan string
-	failureEgress *infraegress.Manager
-	attempts      []uint64
+	mu             sync.Mutex
+	streaming      bool
+	partialImages  int
+	editRequest    provider.ImageEditRequest
+	synced         chan string
+	failureEgress  *infraegress.Manager
+	attempts       []uint64
+	unauthorizedID uint64
 }
 
 type webChatQuotaAdapter struct {
@@ -1295,7 +1639,14 @@ func (a *webImageStreamAdapter) GenerateImage(ctx context.Context, request provi
 	a.partialImages = request.PartialImages
 	failureEgress := a.failureEgress
 	a.attempts = append(a.attempts, request.Credential.ID)
+	unauthorizedID := a.unauthorizedID
 	a.mu.Unlock()
+	if request.Credential.ID == unauthorizedID {
+		return &provider.Response{
+			StatusCode: http.StatusUnauthorized, Status: "401 Unauthorized", Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(`{"error":{"code":"unauthorized"}}`)),
+		}, nil
+	}
 	if failureEgress != nil {
 		lease, err := failureEgress.Acquire(ctx, egressdomain.ScopeWeb, "image-failure")
 		if err != nil {
@@ -1387,7 +1738,7 @@ func (a *failoverAdapter) Definition() provider.Definition {
 	return provider.Definition{
 		Provider: account.ProviderBuild,
 		Conversation: provider.ConversationSurface{
-			Responses: true, StoredResponses: true,
+			Responses: true, Compact: true, StoredResponses: true,
 		},
 	}
 }
@@ -1397,6 +1748,8 @@ func (a *failoverAdapter) ForwardResponse(_ context.Context, request provider.Re
 	a.lastMethod = request.Method
 	a.lastPath = request.Path
 	a.lastPromptCacheKey = request.PromptCacheKey
+	a.lastReasoningReplayKey = request.ReasoningReplayKey
+	a.lastGrokTurnIndex = request.GrokTurnIndex
 	resourceStatus := a.resourceStatus
 	a.mu.Unlock()
 	status, body := http.StatusOK, "ok"
@@ -1421,6 +1774,8 @@ func (a *failoverAdapter) resetAttempts() {
 	a.lastMethod = ""
 	a.lastPath = ""
 	a.lastPromptCacheKey = ""
+	a.lastReasoningReplayKey = ""
+	a.lastGrokTurnIndex = ""
 }
 func (a *failoverAdapter) ListModels(context.Context, account.Credential) ([]string, error) {
 	return nil, nil

@@ -17,10 +17,31 @@ services:
     security_opt:
       - no-new-privileges:true
 
-  # 可选 WARP / 防封边车见独立文件（W2.5）：
-  #   docker compose -f docker-compose.yml -f docker-compose.warp.yml up -d
-  # 管理端出口节点填 socks5h://warp:1080；方案文档：仓库外 plans/W2.5-防封egress方案.md
-  # （旧内联 warp 注释已迁至 docker-compose.warp.yml，避免与 profile 双份漂移。）
+  # 可选防封边车（profile）。管理端出口节点可填 socks5h://warp:1080。
+  # 启动：docker compose --profile warp --profile flaresolverr up -d
+  # 亦可叠加历史 overlay：docker compose -f docker-compose.yml -f docker-compose.warp.yml up -d
+  # Clearance 模式选 FlareSolverr 时用 http://flaresolverr:8191（上游托管 clearance）。
+  # 无 403 时不必启用；方案见仓库外 plans/W2.5-防封egress方案.md
+  warp:
+    container_name: warp
+    image: caomingjun/warp:latest
+    profiles: ["warp"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1080:1080"
+    environment:
+      - WARP_SLEEP=2
+    cap_add:
+      - NET_ADMIN
+
+  flaresolverr:
+    container_name: flaresolverr
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    profiles: ["flaresolverr"]
+    environment:
+      TZ: Asia/Shanghai
+      LOG_LEVEL: info
+    restart: unless-stopped
 
 volumes:
   grok2api-data:

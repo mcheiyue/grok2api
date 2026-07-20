@@ -308,7 +308,10 @@ func convertAnthropicMessages(messages []anthropicMessage, declaredTools map[str
 				if json.Unmarshal(block["data"], &data) != nil || data == "" {
 					return nil, nil, fmt.Errorf("%s.data 无效", path)
 				}
-				input = append(input, map[string]any{"type": "reasoning", "encrypted_content": data})
+				// Grok Build / XAI requires the reasoning summary field to exist
+				// whenever encrypted_content is replayed. An empty summary is the
+				// canonical carrier for Anthropic redacted_thinking.
+				input = append(input, map[string]any{"type": "reasoning", "summary": []any{}, "encrypted_content": data})
 			case "server_tool_use":
 				if role != "assistant" {
 					continue
@@ -500,7 +503,7 @@ func anthropicToolResult(raw json.RawMessage, declaredTools map[string]struct{})
 			if err != nil {
 				return nil, err
 			}
-			parts = append(parts, map[string]any{"type": "input_image", "image_url": imageURL})
+			parts = append(parts, map[string]any{"type": "input_image", "detail": "auto", "image_url": imageURL})
 		case "document":
 			document, err := anthropicDocument(block)
 			if err != nil {
@@ -691,7 +694,7 @@ func convertAnthropicWebSearchTool(tool map[string]json.RawMessage, index int) (
 			}
 			converted["filters"] = map[string]any{"allowed_domains": value}
 		case "max_uses", "blocked_domains", "user_location", "search_context_size":
-			// Build 0.2.102 只支持 allowed_domains；其余 Anthropic
+			// Build 0.2.106 只支持 allowed_domains；其余 Anthropic
 			// 可选控制字段不转发，避免上游因未知参数拒绝整个请求。
 			continue
 		default:

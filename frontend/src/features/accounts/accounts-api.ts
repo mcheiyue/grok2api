@@ -5,6 +5,7 @@ import type { SortOrder } from "@/shared/lib/table-sort";
 
 export type AccountProvider = "grok_build" | "grok_web" | "grok_console";
 export type BuildRouteMode = "auto" | "build" | "xai";
+export type AccountCleanupStatus = "cooldown" | "disabled" | "reauthRequired";
 
 export type BillingDTO = {
   planCode?: string;
@@ -66,6 +67,8 @@ export type AccountDTO = {
   authType: "oauth" | "sso";
   webTier?: "auto" | "basic" | "super" | "heavy";
   webTierSyncedAt?: string;
+  nsfwEnabledAt?: string;
+  termsAcceptedAt?: string;
   name: string;
   email?: string;
   userId?: string;
@@ -93,10 +96,19 @@ export type AccountDTO = {
   linkedAccountId?: string;
   linkedAccountName?: string;
   linkedProvider?: "grok_build" | "grok_web";
+  linkedAccounts?: LinkedAccountDTO[];
   createdAt: string;
   billing?: BillingDTO;
   quota: QuotaDTO;
   quotaWindows?: Array<{ mode: string; remaining: number; total: number; usagePercent: number; breakdown?: Array<{ productCode: number; usagePercent: number }>; windowSeconds: number; resetAt?: string; syncedAt?: string; source: "default" | "estimated" | "upstream" }>;
+};
+
+export type LinkedAccountDTO = {
+  id: string;
+  provider: "grok_build" | "grok_web" | "grok_console";
+  name: string;
+  email?: string;
+  userId?: string;
 };
 
 export type AccountUpdateInput = {
@@ -162,14 +174,15 @@ const quotaWindowValidator = hasShape({
   mode: isString, remaining: isNumber, total: isNumber, usagePercent: isNumber, breakdown: isOptional(isArrayOf(quotaBreakdownValidator)),
   windowSeconds: isNumber, resetAt: isOptional(isString), syncedAt: isOptional(isString), source: isOneOf("default", "estimated", "upstream"),
 });
+const linkedAccountValidator = hasShape({ id: isString, provider: isOneOf("grok_build", "grok_web", "grok_console"), name: isString, email: isOptional(isString), userId: isOptional(isString) });
 const accountValidator = hasShape({
   id: isString, provider: isOneOf("grok_build", "grok_web", "grok_console"), authType: isOneOf("oauth", "sso"), webTier: isOptional(isOneOf("auto", "basic", "super", "heavy")),
-  webTierSyncedAt: isOptional(isString), name: isString, email: isOptional(isString), userId: isOptional(isString), teamId: isOptional(isString),
+  webTierSyncedAt: isOptional(isString), nsfwEnabledAt: isOptional(isString), termsAcceptedAt: isOptional(isString), name: isString, email: isOptional(isString), userId: isOptional(isString), teamId: isOptional(isString),
   enabled: isBoolean, authStatus: isOneOf("active", "reauthRequired"), expiresAt: isOptional(isString), refreshable: isBoolean, cloudflareCookieConfigured: isBoolean,
   buildSuperEntitled: isBoolean, buildRouteMode: isOneOf("auto", "build", "xai"), buildBotFlagged: isBoolean, modelSyncFailed: isOptional(isBoolean), refreshDueAt: isOptional(isString), lastRefreshAt: isOptional(isString), refreshFailureCount: isNumber,
   lastRefreshErrorCode: isOptional(isString), priority: isNumber, maxConcurrent: isNumber, minimumRemaining: isNumber,
   failureCount: isNumber, cooldownUntil: isOptional(isString), lastError: isOptional(isString), lastUsedAt: isOptional(isString),
-  linkedAccountId: isOptional(isString), linkedAccountName: isOptional(isString), linkedProvider: isOptional(isOneOf("grok_build", "grok_web")),
+  linkedAccountId: isOptional(isString), linkedAccountName: isOptional(isString), linkedProvider: isOptional(isOneOf("grok_build", "grok_web")), linkedAccounts: isOptional(isArrayOf(linkedAccountValidator)),
   createdAt: isString, billing: isOptional(billingValidator), quota: quotaValidator, quotaWindows: isOptional(isArrayOf(quotaWindowValidator)),
 });
 const decodeBilling = createValidatedDecoder<BillingDTO>("billing", billingValidator);
@@ -237,6 +250,18 @@ export function refreshAccountToken(id: string): Promise<AccountDTO> {
   return apiRequest(`/api/admin/v1/accounts/${id}/refresh-token`, { method: "POST" }, decodeAccount);
 }
 
+export function acceptWebAccountTerms(id: string): Promise<{ completed: boolean }> {
+  return apiRequest(`/api/admin/v1/accounts/web/${id}/accept-terms`, { method: "POST" }, decodeBooleanResult<{ completed: boolean }>("completed"));
+}
+
+export function setWebAccountBirthDate(id: string): Promise<{ completed: boolean }> {
+  return apiRequest(`/api/admin/v1/accounts/web/${id}/birth-date`, { method: "POST" }, decodeBooleanResult<{ completed: boolean }>("completed"));
+}
+
+export function enableWebAccountNSFW(id: string): Promise<{ completed: boolean }> {
+  return apiRequest(`/api/admin/v1/accounts/web/${id}/nsfw`, { method: "POST" }, decodeBooleanResult<{ completed: boolean }>("completed"));
+}
+
 export type AccountBatchResultDTO = { succeeded: number; failed: number };
 export type AccountTokenRefreshResultDTO = AccountBatchResultDTO & { skipped: number };
 
@@ -260,6 +285,16 @@ export type BuildConversionInput =
 export type WebConsoleSyncInput =
   | { all: true; ids?: never; strategy: WebConsoleSyncStrategy }
   | { all?: false; ids: string[]; strategy: WebConsoleSyncStrategy };
+
+export type WebAccountScriptActions = {
+  acceptTerms: boolean;
+  setBirthDate: boolean;
+  enableNSFW: boolean;
+};
+
+export type WebAccountScriptsInput =
+  | { all: true; ids?: never; actions: WebAccountScriptActions }
+  | { all?: false; ids: string[]; actions: WebAccountScriptActions };
 
 export type AccountTaskProgressDTO = {
   completed: number;
@@ -382,6 +417,10 @@ export function syncWebAccountsToConsole(input: WebConsoleSyncInput, onProgress?
   return runAccountTask("/api/admin/v1/accounts/web/sync-to-console", input, ["created", "updated", "skipped", "synced", "syncFailed"], onProgress, signal);
 }
 
+export function runWebAccountScripts(input: WebAccountScriptsInput, onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountBatchResultDTO> {
+  return runAccountTask("/api/admin/v1/accounts/web/run-scripts", input, ["succeeded", "failed"], onProgress, signal);
+}
+
 export function importAccounts(files: readonly File[], onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountImportResultDTO> {
   const body = new FormData();
   files.forEach((file) => body.append("files", file, file.name));
@@ -404,8 +443,8 @@ export function refreshAccountQuota(id: string): Promise<AccountDTO> {
   return apiRequest(`/api/admin/v1/accounts/${id}/refresh-quota`, { method: "POST" }, decodeAccount);
 }
 
-export function exportAccounts(): Promise<Blob> {
-  return apiDownload("/api/admin/v1/accounts/export");
+export function exportAccounts(provider: AccountProvider): Promise<Blob> {
+  return apiDownload(`/api/admin/v1/accounts/export?provider=${encodeURIComponent(provider)}`);
 }
 
 export function updateAccountsEnabled(ids: string[], enabled: boolean, provider: AccountProvider): Promise<{ updated: number }> {
@@ -414,6 +453,14 @@ export function updateAccountsEnabled(ids: string[], enabled: boolean, provider:
 
 export function refreshAccountsQuota(ids: string[], provider: AccountProvider): Promise<{ succeeded: number; failed: number }> {
   return apiRequest("/api/admin/v1/accounts/batch/refresh-quotas", { method: "POST", body: { ids, provider } }, createObjectDecoder("account batch", { succeeded: isNumber, failed: isNumber }));
+}
+
+export function refreshAccountsTokens(ids: string[], provider: AccountProvider): Promise<AccountTokenRefreshResultDTO> {
+  return apiRequest("/api/admin/v1/accounts/batch/refresh-tokens", { method: "POST", body: { ids, provider } }, createObjectDecoder("account token refresh batch", { succeeded: isNumber, failed: isNumber, skipped: isNumber }));
+}
+
+export function cleanupAccounts(provider: AccountProvider, statuses: AccountCleanupStatus[]): Promise<{ deleted: number }> {
+  return apiRequest("/api/admin/v1/accounts/cleanup", { method: "POST", body: { provider, statuses } }, decodeCountResult<{ deleted: number }>("deleted"));
 }
 
 export function deleteAccounts(ids: string[], provider: AccountProvider): Promise<{ deleted: number }> {

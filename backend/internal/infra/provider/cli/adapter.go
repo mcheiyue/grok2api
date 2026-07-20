@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -52,6 +53,8 @@ type Adapter struct {
 	fallbackMarker FallbackMarker
 	uploadIssuer   VideoUploadIssuer
 	replay         *reasoningreplay.ReasoningReplay
+	compaction     *gatewayCompactionCodec
+	logger         *slog.Logger
 }
 
 func NewAdapter(cfg Config, cipher *security.Cipher) *Adapter {
@@ -62,7 +65,13 @@ func NewAdapter(cfg Config, cipher *security.Cipher) *Adapter {
 	agentID := uuid.NewString()
 	return &Adapter{
 		cfg: cfg, http: httpClient, oauth: newOAuthClient(httpClient), cipher: cipher, base: transport,
-		agentID: agentID, modelsETags: make(map[uint64]string),
+		agentID: agentID, modelsETags: make(map[uint64]string), compaction: newGatewayCompactionCodec(cipher), logger: slog.Default(),
+	}
+}
+
+func (a *Adapter) SetLogger(logger *slog.Logger) {
+	if logger != nil {
+		a.logger = logger
 	}
 }
 
@@ -113,40 +122,71 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	body := request.Body
 	var toolCompatibility *responsesToolCompatibility
 	var conversationOptions conversation.ResponseOptions
+	compactionRequested := false
 	if request.NormalizeBody {
 		if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
 			body, conversationOptions, err = conversation.ConvertRequestWithOptions(body, request.Model, request.Operation)
 		} else {
+			var foreignCompactions int
+			body, foreignCompactions, err = expandGatewayCompactionHistory(body, a.compaction, request.PromptCacheKey)
+			if err != nil {
+				return invalidResponsesResponse(err), nil
+			}
 			body, toolCompatibility, err = normalizeResponsesRequest(body, request.Model)
+			if toolCompatibility != nil {
+				compactionRequested = toolCompatibility.compactionRequested
+				if foreignCompactions > 0 {
+					toolCompatibility.addWarning("foreign_compaction_omitted")
+				}
+			}
 		}
 		if err != nil {
 			if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
 				return invalidConversationResponse(request.Operation, err), nil
 			}
+			return invalidResponsesResponse(err), nil
+		}
+	}
+	if compactionRequested {
+		body, err = prepareGatewayCompactionSample(body)
+		if err != nil {
 			return invalidResponsesResponse(err), nil
 		}
 	}
 	if len(body) > 0 && request.Method == http.MethodPost {
-		body, err = injectPromptCacheKey(body, request.PromptCacheKey)
-		if err != nil {
-			err = fmt.Errorf("写入 prompt_cache_key: %w", err)
-			if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
-				return invalidConversationResponse(request.Operation, err), nil
+		if !compactionRequested {
+			body, err = injectPromptCacheKey(body, request.PromptCacheKey)
+			if err != nil {
+				err = fmt.Errorf("写入 prompt_cache_key: %w", err)
+				if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
+					return invalidConversationResponse(request.Operation, err), nil
+				}
+				return invalidResponsesResponse(err), nil
 			}
-			return invalidResponsesResponse(err), nil
 		}
-		// 服务端推理回放：在 prompt_cache_key 写入后、出站前注入上一轮 encrypted items。
-		if a.replay != nil && request.PromptCacheKey != "" && !isCompactPath(request.Path) {
-			body = a.replay.Apply(ctx, request.Model, request.PromptCacheKey, body)
+	}
+	if compactionRequested {
+		warnings := ""
+		if toolCompatibility != nil {
+			warnings = toolCompatibility.warningHeader()
 		}
+		return a.forwardGatewayCompaction(ctx, request, accessToken, body, warnings)
 	}
 	// 显式模式优先；auto 下仅已确认 Super 且 bot_flag_source=1 的账号默认走 XAI。
 	primaryBase := a.primaryBaseURL()
 	base := a.inferenceBaseForOperation(request.Credential, request.Billing, request.Method, request.Path)
+	// 缓存亲和与推理回放使用不同身份。回放还必须绑定实际账号和上游平面，
+	// 避免把一个账号或 Build 平面签发的 opaque reasoning 发给另一作用域。
+	replayBaseBody := body
+	body, replayKey := a.applyReasoningReplay(ctx, request, replayBaseBody, base)
 	resp, reqURL, err := a.doResponseRequest(ctx, request, accessToken, body, base)
 	if err != nil {
 		return nil, err
 	}
+	if err := normalizeGzipResponse(resp); err != nil {
+		return nil, err
+	}
+	resp, reqURL, reasoningRecovery := a.recoverReasoningDecodeFailure(ctx, request, accessToken, body, base, replayKey, resp, reqURL)
 	// 仅可回退操作在当次 Build 主地址明确 403 时用等价请求探测 XAI。
 	if strings.EqualFold(base, primaryBase) && shouldProbeXAIInferenceFallback(request.Credential, request.Billing, request.Method, request.Path, resp.StatusCode) {
 		// 缓冲主 403 正文，备用失败时原样回放，避免二次 primary POST。
@@ -158,10 +198,19 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		primaryResp := cloneBufferedResponse(resp, primaryBody, primaryTruncated)
 		fallbackBase := a.fallbackBaseURL()
 		if fallbackBase != "" && !strings.EqualFold(fallbackBase, base) {
-			fallbackResp, fallbackURL, fallbackErr := a.doResponseRequest(ctx, request, accessToken, body, fallbackBase)
+			fallbackBody, fallbackReplayKey := a.applyReasoningReplay(ctx, request, replayBaseBody, fallbackBase)
+			fallbackResp, fallbackURL, fallbackErr := a.doResponseRequest(ctx, request, accessToken, fallbackBody, fallbackBase)
+			if fallbackErr == nil {
+				fallbackErr = normalizeGzipResponse(fallbackResp)
+			}
+			fallbackRecovery := reasoningRecoveryOutcome{}
+			if fallbackErr == nil {
+				fallbackResp, fallbackURL, fallbackRecovery = a.recoverReasoningDecodeFailure(ctx, request, accessToken, fallbackBody, fallbackBase, fallbackReplayKey, fallbackResp, fallbackURL)
+			}
 			if fallbackErr == nil && isHTTPSuccess(fallbackResp.StatusCode) {
 				a.activateBuildAPIFallback(ctx, &request.Credential)
-				resp, reqURL = fallbackResp, fallbackURL
+				resp, reqURL, base, body, replayKey = fallbackResp, fallbackURL, fallbackBase, fallbackBody, fallbackReplayKey
+				reasoningRecovery = reasoningRecovery.merge(fallbackRecovery)
 			} else {
 				if fallbackErr == nil {
 					_ = fallbackResp.Body.Close()
@@ -173,21 +222,18 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			resp = primaryResp
 		}
 	}
-
-	if err := normalizeGzipResponse(resp); err != nil {
-		return nil, err
-	}
 	modelCatalogChanged := a.modelCatalogChanged(request.Credential.ID, resp.Header.Get("x-models-etag"))
 	// 在协议转换前捕获上游 Responses 形态，写入/清理推理回放缓存。
-	if a.shouldCaptureReplay(request, resp) {
-		resp.Body = a.replay.CaptureBody(resp.Body, request.Model, request.PromptCacheKey, request.Streaming, isCompactPath(request.Path))
+	if a.shouldCaptureReplay(request, resp, replayKey) {
+		resp.Body = a.replay.CaptureBody(resp.Body, request.Model, replayKey, request.Streaming, isCompactPath(request.Path))
 	}
-	responsesOperation := request.Operation == "" || request.Operation == conversation.OperationResponses
+	responsesOperation := request.Operation == "" || request.Operation == conversation.OperationResponses || request.Operation == conversation.OperationCompaction
 	if responsesOperation && toolCompatibility != nil {
 		if warnings := toolCompatibility.warningHeader(); warnings != "" {
 			resp.Header.Set("X-Grok2API-Compatibility-Warnings", warnings)
 		}
 	}
+	reasoningRecovery.appendWarnings(resp.Header)
 	if responsesOperation && toolCompatibility != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		if request.Streaming {
 			resp.Body = toolCompatibility.normalizeResponseStream(resp.Body)
@@ -252,17 +298,45 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body, UpstreamURL: reqURL, ModelCatalogChanged: modelCatalogChanged}, nil
 }
 
-func (a *Adapter) shouldCaptureReplay(request provider.ResponseResourceRequest, resp *http.Response) bool {
+func (a *Adapter) shouldCaptureReplay(request provider.ResponseResourceRequest, resp *http.Response, replayKey string) bool {
 	if a.replay == nil || !a.replay.Enabled() || resp == nil {
 		return false
 	}
-	if request.Method != http.MethodPost || strings.TrimSpace(request.PromptCacheKey) == "" {
+	if request.Method != http.MethodPost || strings.TrimSpace(replayKey) == "" {
 		return false
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return false
 	}
 	return true
+}
+
+func (a *Adapter) applyReasoningReplay(ctx context.Context, request provider.ResponseResourceRequest, body []byte, base string) ([]byte, string) {
+	if a.replay == nil || !a.replay.Enabled() || request.Method != http.MethodPost {
+		return body, ""
+	}
+	key := a.scopedReasoningReplayKey(request, base)
+	if key == "" {
+		return body, ""
+	}
+	if isCompactPath(request.Path) {
+		// compact 不注入历史，但成功后仍需用同一作用域清理旧 replay。
+		return body, key
+	}
+	return a.replay.Apply(ctx, request.Model, key, body), key
+}
+
+func (a *Adapter) scopedReasoningReplayKey(request provider.ResponseResourceRequest, base string) string {
+	seed := strings.TrimSpace(request.ReasoningReplayKey)
+	if seed == "" || request.Credential.ID == 0 {
+		return ""
+	}
+	plane := "build"
+	if fallback := a.fallbackBaseURL(); fallback != "" && strings.EqualFold(strings.TrimRight(base, "/"), fallback) {
+		plane = "xai"
+	}
+	digest := sha256.Sum256([]byte(fmt.Sprintf("grok2api:reasoning-replay:v2:%s:%d:%s", seed, request.Credential.ID, plane)))
+	return hex.EncodeToString(digest[:])
 }
 
 func isCompactPath(path string) bool {
@@ -274,7 +348,7 @@ func (a *Adapter) doResponseRequest(ctx context.Context, request provider.Respon
 	if len(body) > 0 {
 		bodyReader = bytes.NewReader(body)
 	}
-	requestCtx := infraegress.WithAccount(ctx, string(account.ProviderBuild), request.Credential.ID)
+	requestCtx := infraegress.WithCredential(ctx, request.Credential)
 	req, err := http.NewRequestWithContext(requestCtx, request.Method, a.urlWithBase(base, request.Path), bodyReader)
 	if err != nil {
 		return nil, "", err
@@ -282,6 +356,7 @@ func (a *Adapter) doResponseRequest(ctx context.Context, request provider.Respon
 	if err := a.applyHeaders(req, request.Credential, accessToken, request.Model, request.PromptCacheKey, true); err != nil {
 		return nil, "", err
 	}
+	applyGrokTurnIndexHeader(req, request.GrokTurnIndex)
 	if len(body) > 0 {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -299,6 +374,34 @@ func (a *Adapter) doResponseRequest(ctx context.Context, request provider.Respon
 		return nil, "", err
 	}
 	return resp, req.URL.String(), nil
+}
+
+// applyGrokTurnIndexHeader 只在请求已有稳定 Grok session 时透传真实客户端轮次。
+func applyGrokTurnIndexHeader(request *http.Request, value string) {
+	if request.Header.Get("x-grok-session-id") == "" {
+		return
+	}
+	if turnIndex := normalizeGrokTurnIndex(value); turnIndex != "" {
+		request.Header.Set("x-grok-turn-idx", turnIndex)
+	}
+}
+
+// normalizeGrokTurnIndex 只接受官方客户端生成的非负十进制 u64。
+// 空值或非法值直接省略，避免网关根据历史、工具循环或 compact 结果伪造轮次。
+func normalizeGrokTurnIndex(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 20 {
+		return ""
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return ""
+		}
+	}
+	if _, err := strconv.ParseUint(value, 10, 64); err != nil {
+		return ""
+	}
+	return value
 }
 
 // invalidResponsesResponse 将本地协议校验错误转换为标准 OpenAI 错误响应，避免触发上游账号重试。
@@ -385,7 +488,7 @@ func (a *Adapter) NormalizeAccountModelCapabilities(models []string, billing *ac
 }
 
 func (a *Adapter) listModelsAt(ctx context.Context, credential account.Credential, accessToken, base string) ([]string, int, error) {
-	requestCtx := infraegress.WithAccount(ctx, string(account.ProviderBuild), credential.ID)
+	requestCtx := infraegress.WithCredential(ctx, credential)
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, a.urlWithBase(base, "/models"), nil)
 	if err != nil {
 		return nil, 0, err
@@ -482,12 +585,15 @@ func (a *Adapter) GetBilling(ctx context.Context, credential account.Credential)
 func (a *Adapter) RefreshCredential(ctx context.Context, credential account.Credential) (provider.RefreshedCredential, error) {
 	refreshToken, err := a.cipher.Decrypt(credential.EncryptedRefreshToken)
 	if err != nil {
-		return provider.RefreshedCredential{}, &provider.CredentialRefreshError{Code: "credential_decrypt_failed", Permanent: true, Cause: err}
+		// 解密失败通常是本地 encryption key 临时/不匹配，属于可恢复故障；
+		// 不得标记为 permanent（否则密钥恢复后手动/批量刷新永远不会重试）。
+		// 真正的 OAuth 永久失败（如 invalid_grant）由 oauth.refresh 返回 Permanent=true。
+		return provider.RefreshedCredential{}, &provider.CredentialRefreshError{Code: "credential_decrypt_failed", Permanent: false, Cause: err}
 	}
 	if strings.TrimSpace(refreshToken) == "" {
 		return provider.RefreshedCredential{}, &provider.CredentialRefreshError{Code: "missing_refresh_token", Permanent: true}
 	}
-	refreshCtx := infraegress.WithAccount(ctx, string(account.ProviderBuild), credential.ID)
+	refreshCtx := infraegress.WithCredential(ctx, credential)
 	tokens, err := a.oauth.refresh(refreshCtx, refreshToken)
 	if err != nil {
 		return provider.RefreshedCredential{}, err
@@ -536,14 +642,18 @@ func (a *Adapter) applyHeaders(req *http.Request, credential account.Credential,
 
 	if trace {
 		requestID := uuid.NewString()
+		// 对齐 CPA：仅在存在稳定 session 时设置 x-grok-conv-id / session-id。
+		// 禁止每请求随机 UUID，否则会打散 xAI 服务器亲和，导致 cached_tokens 长期为 0。
 		sessionID, err := grokSessionID(promptCacheKey)
 		if err != nil {
 			return err
 		}
 		req.Header.Set("x-authenticateresponse", "authenticate-response")
 		req.Header.Set("x-grok-agent-id", a.agentID)
-		req.Header.Set("x-grok-session-id", sessionID)
-		req.Header.Set("x-grok-conv-id", sessionID)
+		if sessionID != "" {
+			req.Header.Set("x-grok-session-id", sessionID)
+			req.Header.Set("x-grok-conv-id", sessionID)
+		}
 		req.Header.Set("x-grok-req-id", requestID)
 		// 网关无法从无状态 API 请求可靠恢复 CLI prompt index；该字段在
 		// 官方协议中可选，因此不伪造 x-grok-turn-idx。
@@ -576,19 +686,17 @@ func (a *Adapter) applyHeaders(req *http.Request, credential account.Credential,
 	return nil
 }
 
+// grokSessionID 将稳定会话键转为上游 x-grok-conv-id。
+// 空键返回空串（对齐 CPA grok_build_stays_stateless_without_session），绝不每请求随机生成。
 func grokSessionID(promptCacheKey string) (string, error) {
 	key := strings.TrimSpace(promptCacheKey)
-	if key != "" {
-		if parsed, err := uuid.Parse(key); err == nil {
-			return parsed.String(), nil
-		}
-		return uuid.NewHash(sha256.New(), uuid.NameSpaceURL, []byte("grok2api:session:"+key), 8).String(), nil
+	if key == "" {
+		return "", nil
 	}
-	value, err := uuid.NewV7()
-	if err != nil {
-		return "", err
+	if parsed, err := uuid.Parse(key); err == nil {
+		return parsed.String(), nil
 	}
-	return value.String(), nil
+	return uuid.NewHash(sha256.New(), uuid.NameSpaceURL, []byte("grok2api:session:"+key), 8).String(), nil
 }
 
 func injectPromptCacheKey(body []byte, clientKey string) ([]byte, error) {
@@ -654,7 +762,7 @@ func (a *Adapter) getBilling(ctx context.Context, credential account.Credential,
 	if query != "" {
 		endpoint += "?" + query
 	}
-	requestCtx := infraegress.WithAccount(ctx, string(account.ProviderBuild), credential.ID)
+	requestCtx := infraegress.WithCredential(ctx, credential)
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return account.Billing{}, err
@@ -682,7 +790,7 @@ func (a *Adapter) getBilling(ctx context.Context, credential account.Credential,
 
 func (a *Adapter) getSubscriptionTier(ctx context.Context, credential account.Credential, accessToken string) (string, error) {
 	endpoint := a.url("/user") + "?include=subscription"
-	requestCtx, cancel := context.WithTimeout(infraegress.WithAccount(ctx, string(account.ProviderBuild), credential.ID), subscriptionTierTimeout)
+	requestCtx, cancel := context.WithTimeout(infraegress.WithCredential(ctx, credential), subscriptionTierTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint, nil)
 	if err != nil {

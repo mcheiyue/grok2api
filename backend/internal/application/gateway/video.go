@@ -328,12 +328,14 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		failureHandled := false
 		if errors.Is(err, provider.ErrUnauthorized) {
 			if lease.Credential.AuthType == account.AuthTypeSSO {
-				_ = s.accounts.MarkReauthRequired(failureCtx, lease.Credential.ID, fmt.Sprintf("%s SSO credential rejected", lease.Credential.Provider))
+				s.markSSOCredentialRejected(failureCtx, lease.Credential, fmt.Sprintf("%s SSO credential rejected", lease.Credential.Provider))
 			}
-			s.selector.MarkFailure(failureCtx, lease.Credential, http.StatusUnauthorized, 0)
 			failureHandled = true
 		} else if status, ok := provider.ErrorHTTPStatus(err); ok {
 			switch {
+			case status == http.StatusUnauthorized && lease.Credential.AuthType == account.AuthTypeSSO:
+				s.markSSOCredentialRejected(failureCtx, lease.Credential, fmt.Sprintf("%s SSO credential rejected", lease.Credential.Provider))
+				failureHandled = true
 			case status == http.StatusForbidden && s.providers.RetryForbiddenAsEgress(lease.Credential.Provider):
 				// Web Provider 已对 anti-bot 403 降低出口健康并重建浏览器会话；
 				// 视频请求已提交，不能换号重试，也不能误伤账号池。
@@ -461,7 +463,11 @@ func (s *Service) reconcileVideoUsage(ctx context.Context) error {
 }
 
 func (s *Service) recordVideoAudit(ctx context.Context, job media.Job, durationMS int64) error {
-	accountID := job.AccountID
+	var accountID *uint64
+	if job.AccountID > 0 {
+		value := job.AccountID
+		accountID = &value
+	}
 	createdAt := time.Now().UTC()
 	if job.CompletedAt != nil && !job.CompletedAt.IsZero() {
 		createdAt = job.CompletedAt.UTC()
@@ -480,7 +486,7 @@ func (s *Service) recordVideoAudit(ctx context.Context, job media.Job, durationM
 		EventID: "video_usage_" + job.ID, RequestID: job.RequestID, ClientKeyID: job.ClientKeyID, ClientKeyName: job.ClientKeyName,
 		ModelRouteID: job.ModelRouteID, ModelPublicID: job.Model, ModelUpstreamModel: job.UpstreamModel,
 		Provider: job.Provider, Operation: audit.OperationVideo, UsageSource: audit.UsageSourceNone,
-		AccountID: &accountID, AccountName: job.AccountName, StatusCode: statusCode, ErrorCode: job.ErrorCode,
+		AccountID: accountID, AccountName: job.AccountName, StatusCode: statusCode, ErrorCode: job.ErrorCode,
 		EgressNodeID: job.EgressNodeID, EgressNodeName: job.EgressNodeName, EgressScope: job.EgressScope, EgressMode: audit.EgressMode(job.EgressMode),
 		MediaInputImages: int64(len(decodeVideoInput(job.InputJSON))),
 		DurationMS:       durationMS, CreatedAt: createdAt,
