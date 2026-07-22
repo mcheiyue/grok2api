@@ -38,11 +38,13 @@ var (
 	ErrResponseStateUnsupported   = errors.New("目标模型不支持有状态 Response")
 	ErrConversationUnsupported    = errors.New("目标模型不支持当前对话协议")
 	ErrVideoInputTooLarge         = errors.New("视频参考图片总大小超过 32 MiB")
+	ErrLedgerUnavailable          = errors.New("计费账本暂不可用")
 )
 
 const responseOwnershipTTL = 30 * 24 * time.Hour
 const finalizationTimeout = 5 * time.Second
-const textBillingReservationTTL = 2 * time.Hour
+const minimumTextBillingReservationTTL = 2 * time.Hour
+const billingReservationCrashGrace = 10 * time.Minute
 const mediaBillingReservationTTL = 24 * time.Hour
 const modelCatalogRefreshTimeout = 30 * time.Second
 
@@ -99,6 +101,10 @@ type auditRecorder interface {
 	Create(ctx context.Context, value audit.Record) error
 }
 
+type ledgerReadinessChecker interface {
+	CheckLedgerReady() error
+}
+
 type routeResolver interface {
 	Get(ctx context.Context, id uint64) (modeldomain.Route, error)
 	GetByPublicID(ctx context.Context, publicID string) (modeldomain.Route, error)
@@ -127,6 +133,7 @@ type Service struct {
 	consoleBreaker *consoleTeamCircuitBreaker
 	responses      repository.ResponseRepository
 	maxAttempts    atomic.Int64
+	requestTimeout atomic.Int64
 	mediaJobs      repository.MediaJobRepository
 	mediaAssets    videoAssetStore
 	mediaQueue     chan string
@@ -260,6 +267,29 @@ func (s *Service) ConfigureConsoleTeamCircuit(rpmSec, rpsSec, unknownSec int) {
 		return
 	}
 	s.consoleBreaker = newConsoleTeamCircuitBreaker(rpmSec, rpsSec, unknownSec)
+}
+
+func (s *Service) UpdateRequestTimeout(value time.Duration) {
+	if value <= 0 {
+		value = minimumTextBillingReservationTTL
+	}
+	s.requestTimeout.Store(int64(value))
+}
+
+func (s *Service) textBillingReservationTTL() time.Duration {
+	ttl := time.Duration(s.requestTimeout.Load()) + finalizationTimeout + billingReservationCrashGrace
+	return max(minimumTextBillingReservationTTL, ttl)
+}
+
+func (s *Service) checkLedgerReady() error {
+	checker, ok := s.audits.(ledgerReadinessChecker)
+	if !ok {
+		return nil
+	}
+	if err := checker.CheckLedgerReady(); err != nil {
+		return ErrLedgerUnavailable
+	}
+	return nil
 }
 
 func (s *Service) CreateResponse(ctx context.Context, input Input) (*Result, error) {
@@ -499,6 +529,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	if !ok {
 		return nil, ErrNoAvailableAccount
 	}
+	physicalCallCtx := infraegress.WithPhysicalCallTrace(ctx, string(route.Provider), string(operation))
 	supportsStoredResponses := s.providers.SupportsStoredResponses(route.Provider)
 	if input.PreviousResponseID != "" && !supportsStoredResponses {
 		return nil, ErrResponseStateUnsupported
@@ -520,8 +551,11 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		}
 	}
 	pricingModel := s.providers.PricingModel(route.Provider, route.UpstreamModel)
+	if err := s.checkLedgerReady(); err != nil {
+		return nil, err
+	}
 	if reservation, priced := audit.EstimateOfficialTextReservation(pricingModel, input.Body); priced {
-		if _, err := s.clientKeys.ReserveBilling(ctx, input.ClientKey, eventID, reservation.CostInUSDTicks, textBillingReservationTTL); err != nil {
+		if _, err := s.clientKeys.ReserveBilling(ctx, input.ClientKey, eventID, reservation.CostInUSDTicks, s.textBillingReservationTTL()); err != nil {
 			return nil, err
 		}
 	}
@@ -534,10 +568,11 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	var lastFailure *UpstreamFailure
 	failureAttempts := newFailureAttemptRecorder(http.MethodPost, path)
 	responseStartedAt := startedAt
-	forwardResponse := func(credential accountdomain.Credential, billing *accountdomain.Billing) (*provider.Response, error) {
+	forwardResponse := func(lease *accountLease, credential accountdomain.Credential, billing *accountdomain.Billing) (*provider.Response, error) {
 		started := time.Now()
 		responseStartedAt = started
-		response, err := adapter.ForwardResponse(ctx, provider.ResponseResourceRequest{Credential: credential, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, ReasoningReplayKey: reasoningReplayKey, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: input.GrokTurnIndex, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation)})
+		lease.markSelectorUpstreamStarted()
+		response, err := adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: credential, Billing: billing, Method: http.MethodPost, Path: path, Model: route.UpstreamModel, PromptCacheKey: input.PromptCacheKey, ReasoningReplayKey: reasoningReplayKey, AllowClientToolCacheRoute: input.AllowClientToolCacheRoute, GrokTurnIndex: input.GrokTurnIndex, IdempotencyID: idempotencyID, Body: input.Body, Streaming: input.Streaming, NormalizeBody: true, Operation: string(operation)})
 		err = failureAttempts.captureResponse(credential, started, response, err)
 		timing.markUpstream(time.Since(started))
 		return response, err
@@ -600,7 +635,7 @@ attemptLoop:
 			lastFailure = newCredentialUpstreamFailure(err, lease.Credential.ID, lease.Credential.Name)
 			continue
 		}
-		response, err := forwardResponse(credential, lease.Billing)
+		response, err := forwardResponse(lease, credential, lease.Billing)
 		if err != nil {
 			lease.Release()
 			lastErr = err
@@ -642,7 +677,7 @@ attemptLoop:
 			authRecoveryAttempted[credential.ID] = true
 			refreshed, refreshErr := ensureCredential(credential, true)
 			if refreshErr == nil {
-				response, err = forwardResponse(refreshed, lease.Billing)
+				response, err = forwardResponse(lease, refreshed, lease.Billing)
 				credential = refreshed
 			}
 			if refreshErr != nil || err != nil {
@@ -673,7 +708,7 @@ attemptLoop:
 		}
 		egressForbidden := s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden
 		finalEgressForbidden := egressForbidden && (attempt > 0 || attempt+1 >= attempts)
-		if isRetryableResponse(response) && !finalEgressForbidden {
+		if isRetryableResponse(response, route.Provider) && !finalEgressForbidden {
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			body, _ := readRetryableBody(response.Body)
 			if egressForbidden {
@@ -727,7 +762,7 @@ attemptLoop:
 					lastFailure = newCredentialUpstreamFailure(refreshErr, credential.ID, credential.Name)
 					continue attemptLoop
 				}
-				response, err = forwardResponse(refreshed, lease.Billing)
+				response, err = forwardResponse(lease, refreshed, lease.Billing)
 				credential = refreshed
 				if err != nil {
 					lease.Release()
@@ -750,16 +785,23 @@ attemptLoop:
 				s.selector.MarkQuotaStateChanged(credential.Provider)
 				failureHandled = reconcileErr == nil && exhausted
 			} else if used, limit, exhausted := parseFreeQuotaExhaustion(body); exhausted {
-				s.selector.MarkFreeQuotaExhausted(ctx, credential, used, limit)
+				s.selector.MarkFreeQuotaExhausted(ctx, credential, used, limit, quotaRecoveryHints{
+					Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
+				})
 				failureHandled = true
 			} else if lastFailure.ModelQuotaExhausted {
 				s.selector.MarkModelQuotaExhausted(ctx, credential, route.UpstreamModel, retryAfter)
 				failureHandled = true
 			} else if lastFailure.FreeQuotaExhausted {
-				s.selector.MarkFreeQuotaExhausted(ctx, credential, 0, 0)
+				s.selector.MarkFreeQuotaExhausted(ctx, credential, 0, 0, quotaRecoveryHints{
+					Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
+				})
 				failureHandled = true
 			} else if lastFailure.QuotaExhausted {
-				failureHandled = s.selector.MarkPaidQuotaExhausted(ctx, credential, lease.Billing)
+				s.selector.MarkPaymentQuotaExhausted(ctx, credential, quotaRecoveryHints{
+					Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
+				})
+				failureHandled = true
 			}
 			if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.PermanentAccountDenial {
 				if credential.Provider == accountdomain.ProviderBuild {
@@ -797,11 +839,15 @@ attemptLoop:
 		var once sync.Once
 		finalize := func(usage Usage, responseID, errorCode string) {
 			once.Do(func() {
+				successful := response.StatusCode >= 200 && response.StatusCode < 300 && errorCode == ""
+				lease.completeSelectorObservation(successful)
 				lease.Release()
-				persistCtx, cancel := context.WithTimeout(context.Background(), finalizationTimeout)
-				defer cancel()
+				budget := newFinalizationBudget(string(operation), string(route.Provider))
 				if isUpstreamStreamFailure(errorCode) {
-					s.selector.MarkFailure(persistCtx, credential, http.StatusBadGateway, 0)
+					_ = budget.run("account_health", finalizationHealthBudget, func(stageCtx context.Context) error {
+						s.selector.MarkFailure(stageCtx, credential, http.StatusBadGateway, 0)
+						return nil
+					})
 				}
 				now := time.Now().UTC()
 				record := auditBase
@@ -834,38 +880,53 @@ attemptLoop:
 				record.ContextOutputTokens = usage.ContextOutputTokens
 				record.DurationMS = time.Since(startedAt).Milliseconds()
 				record.ErrorCode = errorCode
-				if response.StatusCode < 200 || response.StatusCode >= 300 || errorCode != "" {
-					record.Attempts = failureAttempts.snapshot()
+				attempts := failureAttempts.snapshot()
+				if response.StatusCode < 200 || response.StatusCode >= 300 || errorCode != "" || len(attempts) > 0 {
+					record.Attempts = attempts
 				}
 				record.CreatedAt = now
 				applyAuditEgress(&record, egressTrace, route.Provider)
-				if err := s.audits.Create(persistCtx, record); err != nil {
-					s.logger.Error("request_usage_write_failed", "event_id", record.EventID, "request_id", input.RequestID, "error", err)
+				if supportsStoredResponses && operation == audit.OperationResponses && responseID != "" && successful {
+					err := budget.run("response_ownership", finalizationOwnershipBudget, func(stageCtx context.Context) error {
+						return s.responses.Save(stageCtx, inferencedomain.ResponseOwnership{ResponseID: responseID, AccountID: accountID, ClientKeyID: input.ClientKey.ID, Provider: route.Provider, PromptCacheKey: ownershipPromptCacheKey, ReasoningReplayKey: reasoningReplayKey, ExpiresAt: now.Add(responseOwnershipTTL), CreatedAt: now, UpdatedAt: now})
+					})
+					if err != nil {
+						s.logger.Error("response_ownership_save_failed", "response_id", responseID, "client_key_id", input.ClientKey.ID, "account_id", accountID, "provider", route.Provider, "error", err)
+					}
 				}
-				if usage.ResponseModel != "" {
-					_ = s.accounts.ObserveResponseModel(persistCtx, accountID, usage.ResponseModel)
-				}
-				if response.StatusCode >= 200 && response.StatusCode < 300 && errorCode == "" && lease.QuotaMode != "" {
+				if successful && lease.QuotaMode != "" {
 					if lease.QuotaMode != "weekly" {
 						units := max(1, response.QuotaUnits)
-						updated, err := s.accounts.DecrementQuota(persistCtx, accountID, lease.QuotaMode, units)
+						var updated bool
+						err := budget.run("quota_decrement", finalizationQuotaBudget, func(stageCtx context.Context) error {
+							var decrementErr error
+							updated, decrementErr = s.accounts.DecrementQuota(stageCtx, accountID, lease.QuotaMode, units)
+							return decrementErr
+						})
 						if err != nil {
 							s.logger.Warn("provider_quota_decrement_failed", "provider", credential.Provider, "account_id", accountID, "mode", lease.QuotaMode, "units", units, "error", err)
 						} else if updated {
 							s.selector.ConsumeQuota(credential.Provider, accountID, lease.QuotaMode, units)
 						}
 					}
+				}
+				if err := budget.run("audit", finalizationAuditBudget, func(stageCtx context.Context) error {
+					return s.audits.Create(stageCtx, record)
+				}); err != nil {
+					s.logger.Error("request_usage_write_failed", "event_id", record.EventID, "request_id", input.RequestID, "error", err)
+				}
+				if usage.ResponseModel != "" {
+					_ = budget.run("observed_model", finalizationMetadataBudget, func(stageCtx context.Context) error {
+						return s.accounts.ObserveResponseModel(stageCtx, accountID, usage.ResponseModel)
+					})
+				}
+				if successful && lease.QuotaMode != "" {
 					if quotaKind, _ := s.providers.QuotaKind(credential.Provider); quotaKind == provider.QuotaRemoteWindow {
 						s.accounts.QueueQuotaRefresh(accountID, lease.QuotaMode)
 					}
 				}
-				if supportsStoredResponses && operation == audit.OperationResponses && responseID != "" && response.StatusCode >= 200 && response.StatusCode < 300 {
-					if err := s.responses.Save(persistCtx, inferencedomain.ResponseOwnership{ResponseID: responseID, AccountID: accountID, ClientKeyID: input.ClientKey.ID, Provider: route.Provider, PromptCacheKey: ownershipPromptCacheKey, ReasoningReplayKey: reasoningReplayKey, ExpiresAt: now.Add(responseOwnershipTTL), CreatedAt: now, UpdatedAt: now}); err != nil {
-						s.logger.Error("response_ownership_save_failed", "response_id", responseID, "client_key_id", input.ClientKey.ID, "account_id", accountID, "provider", route.Provider, "error", err)
-					}
-				}
 				outcome := "failed"
-				if response.StatusCode >= 200 && response.StatusCode < 300 && errorCode == "" {
+				if successful {
 					outcome = "success"
 				}
 				timing.finish(s.logger, outcome)
@@ -1103,6 +1164,11 @@ func (s *Service) forwardOwnedResponse(ctx context.Context, input ResourceInput,
 	if !ok {
 		return nil, ErrResponseAccountUnavailable
 	}
+	operation := "response_get"
+	if method == http.MethodDelete {
+		operation = "response_delete"
+	}
+	physicalCallCtx := infraegress.WithPhysicalCallTrace(ctx, string(ownership.Provider), operation)
 	lease, err := s.selector.AcquirePinned(ctx, ownership.Provider, ownership.AccountID, "", "", false)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrResponseAccountUnavailable, err)
@@ -1116,7 +1182,7 @@ func (s *Service) forwardOwnedResponse(ctx context.Context, input ResourceInput,
 	if input.RawQuery != "" {
 		path += "?" + input.RawQuery
 	}
-	response, err := adapter.ForwardResponse(ctx, provider.ResponseResourceRequest{Credential: credential, Method: method, Path: path})
+	response, err := adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: credential, Method: method, Path: path})
 	if err != nil {
 		if isSSOCredentialRejected(err, credential) {
 			s.markSSOCredentialRejected(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
@@ -1143,7 +1209,7 @@ func (s *Service) forwardOwnedResponse(ctx context.Context, input ResourceInput,
 			lease.Release()
 			return nil, refreshErr
 		}
-		response, err = adapter.ForwardResponse(ctx, provider.ResponseResourceRequest{Credential: refreshed, Method: method, Path: path})
+		response, err = adapter.ForwardResponse(physicalCallCtx, provider.ResponseResourceRequest{Credential: refreshed, Method: method, Path: path})
 		credential = refreshed
 		if err != nil {
 			lease.Release()
@@ -1221,11 +1287,22 @@ func isRetryable(status int) bool {
 	return status == 402 || status == 403 || status == 429 || status >= 500
 }
 
-func isRetryableResponse(response *provider.Response) bool {
+func isRetryableResponse(response *provider.Response, upstreamProvider accountdomain.Provider) bool {
 	if response == nil || !isRetryable(response.StatusCode) {
 		return false
 	}
+	// Account-scoped payment failures must always rotate accounts.
+	// Upstream X-Should-Retry:false is only honored for non-account errors (e.g. 5xx history).
+	if forcesAccountFailover(response.StatusCode, upstreamProvider) {
+		return true
+	}
 	return !strings.EqualFold(strings.TrimSpace(response.Header.Get("X-Should-Retry")), "false")
+}
+
+// forcesAccountFailover scopes the Build billing-wall override to the Provider
+// whose 402 contract is known. Other Providers continue honoring X-Should-Retry.
+func forcesAccountFailover(status int, upstreamProvider accountdomain.Provider) bool {
+	return upstreamProvider == accountdomain.ProviderBuild && status == http.StatusPaymentRequired
 }
 
 func parseRetryAfter(value string, now time.Time) time.Duration {

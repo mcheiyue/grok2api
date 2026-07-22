@@ -31,6 +31,10 @@
 
 <table>
 <tr>
+<td width="200" align="center" valign="middle"><a href="https://www.krill-ai.com/register?invite=KJ2VGIRVAE"><img src="https://raw.githubusercontent.com/Krill-ai-org/krill-ai-static/refs/heads/main/krill-logo/Eng/250x150.png" alt="Krill AI" width="160"></a></td>
+<td valign="middle">Thanks to Krill AI for sponsoring this project! Krill provides fast, stable official API access to GPT, Claude, Gemini, and a wide range of Chinese models, along with enterprise customization, invoicing, and dedicated 7×16-hour technical support. Its specially adapted WebSocket connection also delivers exceptionally fast time to first token. Krill offers this project an exclusive discount: register through <a href="https://www.krill-ai.com/register?invite=KJ2VGIRVAE">this link</a> and enter the coupon code “grok2api” when ordering to receive 23% off your first Codex package purchase.</td>
+</tr>
+<tr>
 <td width="200" align="center" valign="middle"><a href="https://github.com/DEEIX-AI/DEEIX-Chat"><img src="frontend/public/sponner/deeix-chat_deeix-ai.png" alt="DEEIX AI / DEEIX Chat" width="160"></a></td>
 <td valign="middle">DEEIX-Chat is an open-source, self-hostable AI Chat platform for individuals, teams, and enterprises that need stable, long-term, unified access to multiple models. It brings models, conversations, files, tool calling, and administration together in one deployable and extensible system. Click <a href="https://github.com/DEEIX-AI/DEEIX-Chat">here</a> to start deploying.</td>
 </tr>
@@ -211,6 +215,17 @@ The frontend runs at `http://127.0.0.1:5173` by default and proxies API requests
 
 After the administrator has been created, change its password and remove `bootstrapAdmin` from the configuration. Keep `credentialEncryptionKey` permanently: changing it makes existing encrypted credentials unreadable.
 
+### Migrating accounts from the Python version
+
+The **Grok Web SSO tokens** used by the Python version can be migrated, but its database or original pool JSON cannot be imported directly. Export **TXT (one token per line)** from the Python v2 admin page, or extract the raw SSO tokens from the old storage. Then open `/accounts` in the Go version, select **Grok Web**, and use **Connect account → Quick import SSO** or **Import account files**.
+
+The Go Web importer accepts:
+
+- TXT: one raw token per line; `sso=<token>` and `sso=<token>; ...` are also accepted
+- JSON: `{"provider":"grok_web","accounts":[{"sso_token":"...","name":"optional","tier":"auto|basic|super|heavy"}]}`
+
+Python pool assignments, tags, status, quota, usage, cooldown, proxy, and Cloudflare metadata are not migrated. TXT imports use tier `auto` and resync upstream state. The Python version did not contain Grok Build OAuth credentials, so its pools cannot be imported under the **Grok Build** tab. Each import is limited to 1,000 files, 30 MiB total, and 10,000 accounts; wait for identity, quota, and model-capability synchronization after importing.
+
 ## Models and routing
 
 Public model names are unqualified by default. Internally, `Build/`, `Web/`, and `Console/` are used as stable route IDs. Qualified names remain available for explicitly selecting a source, but they are not shown as ordinary model names.
@@ -351,6 +366,12 @@ socks5h://Default.{account}:RESIN_PROXY_TOKEN@resin:2260
 At runtime, the placeholder is replaced with a stable anonymous account identity. Linked Web, Build, and Console accounts can reuse the same identity; unlinked accounts continue to use their own fallback identities. Token refreshes do not rotate a persisted identity.
 
 The egress layer retries only connection errors that clearly occur before a request is submitted. Submitted generation requests, authentication failures, exhausted quotas, and upstream rate limits are never automatically replayed at the egress layer.
+
+### Proxy operations and account allocation
+
+The admin console can import HTTP/SOCKS proxy lists from encrypted HTTP(S) subscription sources or pasted plain/Base64 text. It records proxy probe status, latency, and exit IP without exposing proxy credentials or subscription URLs.
+
+Accounts can be explicitly bound in batches to one enabled proxy node. Automatic allocation uses only recently healthy nodes, respects each node's optional account capacity, and balances automatic assignments when sufficient capacity exists. Manual bindings are never moved by automatic balancing.
 
 ## Security and production guidance
 
