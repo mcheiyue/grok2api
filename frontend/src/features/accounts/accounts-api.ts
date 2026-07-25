@@ -214,6 +214,8 @@ type ListAccountsInput = {
   egress?: string;
   renewal?: string;
   risk?: string;
+  agreement?: string;
+  association?: string;
   provider: AccountProvider;
   sortBy?: string;
   sortOrder?: SortOrder;
@@ -227,6 +229,8 @@ export function listAccounts(input: ListAccountsInput): Promise<PaginatedDTO<Acc
   if (input.egress) query.set("egress", input.egress);
   if (input.renewal) query.set("renewal", input.renewal);
   if (input.risk) query.set("risk", input.risk);
+  if (input.agreement) query.set("agreement", input.agreement);
+  if (input.association) query.set("association", input.association);
   if (input.sortBy && input.sortOrder) {
     query.set("sortBy", input.sortBy);
     query.set("sortOrder", input.sortOrder);
@@ -458,6 +462,14 @@ export function updateAccountsEnabled(ids: string[], enabled: boolean, provider:
 
 export function refreshAccountsQuota(ids: string[], provider: AccountProvider): Promise<{ succeeded: number; failed: number }> {
   return apiRequest("/api/admin/v1/accounts/batch/refresh-quotas", { method: "POST", body: { ids, provider } }, createObjectDecoder("account batch", { succeeded: isNumber, failed: isNumber }));
+}
+
+export function resetAccountsQuota(ids: string[], provider: AccountProvider): Promise<{ reset: number }> {
+  return apiRequest("/api/admin/v1/accounts/batch/reset-quota", { method: "POST", body: { ids, provider } }, decodeCountResult<{ reset: number }>("reset"));
+}
+
+export function resetAllAccountQuota(): Promise<{ reset: number }> {
+  return apiRequest("/api/admin/v1/accounts/reset-quota", { method: "POST" }, decodeCountResult<{ reset: number }>("reset"));
 }
 
 export function refreshAccountsTokens(ids: string[], provider: AccountProvider): Promise<AccountTokenRefreshResultDTO> {

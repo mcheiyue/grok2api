@@ -194,10 +194,12 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	egressManager := infraegress.NewManager(egressRepo, cipher)
 	egressManager.SetClearanceLock(refreshLock)
 	egressManager.UpdateClearanceConfig(clearanceConfig(cfg))
+	egressManager.UpdateBuildResponseHeaderTimeout(cfg.Provider.Build.ResponseHeaderTimeout.Value())
 	cliAdapter := cliprovider.NewAdapter(cliprovider.Config{
 		BaseURL: cfg.Provider.Build.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(cfg.Provider.Build.FallbackBaseURL),
 		ClientVersion: cfg.Provider.Build.ClientVersion, ClientIdentifier: cfg.Provider.Build.ClientIdentifier,
 		TokenAuth: cfg.Provider.Build.TokenAuth, UserAgent: cfg.Provider.Build.UserAgent,
+		ResponseHeaderTimeout: cfg.Provider.Build.ResponseHeaderTimeout.Value(),
 	}, cipher)
 	cliAdapter.SetLogger(logger)
 	cliAdapter.SetEgress(egressManager)
@@ -302,6 +304,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	modelRepo.SetInvalidationObserver(invalidationService.Notify)
 	gatewayService := gateway.NewService(modelService, auditService, accountService, clientKeyService, providers, selector, responseRepo, cfg.Routing.MaxAttempts)
 	gatewayService.SetLogger(logger)
+	gatewayService.UpdateBuildForbiddenReauthPolicy(cfg.Accounts.MarkBuildForbiddenReauth, cfg.Accounts.BuildForbiddenReauthCodes)
 	gatewayService.UpdateRequestTimeout(cfg.Server.RequestTimeout.Value())
 	gatewayService.ConfigureMedia(mediaJobRepo, cfg.Provider.Web.MediaConcurrency)
 	gatewayService.ConfigureMediaAssets(mediaService)
@@ -337,7 +340,9 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 			BaseURL: next.Provider.Build.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(next.Provider.Build.FallbackBaseURL),
 			ClientVersion: next.Provider.Build.ClientVersion, ClientIdentifier: next.Provider.Build.ClientIdentifier,
 			TokenAuth: next.Provider.Build.TokenAuth, UserAgent: next.Provider.Build.UserAgent,
+			ResponseHeaderTimeout: next.Provider.Build.ResponseHeaderTimeout.Value(),
 		})
+		egressManager.UpdateBuildResponseHeaderTimeout(next.Provider.Build.ResponseHeaderTimeout.Value())
 		webAdapter.UpdateConfig(webProviderConfig(next))
 		egressManager.UpdateClearanceConfig(clearanceConfig(next))
 		consoleAdapter.UpdateConfig(consoleProviderConfig(next))
@@ -354,6 +359,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 			next.Provider.Console.TeamRPSCooldownSec,
 			next.Provider.Console.TeamUnknownCooldownSec,
 		)
+		gatewayService.UpdateBuildForbiddenReauthPolicy(next.Accounts.MarkBuildForbiddenReauth, next.Accounts.BuildForbiddenReauthCodes)
 		auditService.UpdateWriterConfig(next.Audit.BatchSize, next.Audit.FlushInterval.Value(), next.Audit.CommitDelay.Value())
 		auditService.UpdateLedgerConfig(auditLedgerConfig(next.Audit))
 		clientKeyService.UpdateDefaults(next.ClientKeyDefaults.RPMLimit, next.ClientKeyDefaults.MaxConcurrent)

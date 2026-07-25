@@ -90,6 +90,8 @@ func (r *AccountRepository) List(ctx context.Context, input repository.AccountLi
 			query = query.Where("NOT EXISTS (SELECT 1 FROM account_credentials credential WHERE credential.account_id = provider_accounts.id AND credential.encrypted_refresh <> '')")
 		}
 	}
+	query = applyWebAgreementFilter(query, input.Filter.Agreement)
+	query = applyWebAssociationFilter(query, input.Filter.Association)
 	if input.Filter.RestrictIDs {
 		if len(input.Filter.AccountIDs) == 0 {
 			query = query.Where("1 = 0")
@@ -186,21 +188,16 @@ func (r *AccountRepository) Summarize(ctx context.Context, now time.Time) ([]rep
 }
 
 // ListRoutingCandidates 批量加载账号、额度、恢复状态和目标模型能力，避免推理热路径按账号逐条查询。
-func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider account.Provider, upstreamModel, quotaMode string) ([]account.RoutingCandidate, error) {
+func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode string) ([]account.RoutingCandidate, error) {
 	values, err := r.ListEnabled(ctx, provider)
 	if err != nil {
 		return nil, err
 	}
 	bound := make(map[uint64]bool)
 	if strings.TrimSpace(upstreamModel) != "" {
-		var boundIDs []uint64
-		if err := r.db.db.WithContext(ctx).
-			Table("model_route_accounts AS binding").
-			Select("binding.account_id").
-			Joins("JOIN model_routes AS route ON route.id = binding.model_route_id").
-			Where("route.provider = ? AND route.upstream_model = ?", provider, upstreamModel).
-			Scan(&boundIDs).Error; err != nil {
-			return nil, err
+		boundIDs, loadErr := r.listRoutingBoundAccountIDs(ctx, provider, modelRouteID, upstreamModel)
+		if loadErr != nil {
+			return nil, loadErr
 		}
 		if len(boundIDs) > 0 {
 			for _, id := range boundIDs {
@@ -373,18 +370,13 @@ func (r *AccountRepository) ListRoutingAccountBases(ctx context.Context, provide
 	return result, nil
 }
 
-func (r *AccountRepository) ListRoutingAccountOverlays(ctx context.Context, provider account.Provider, upstreamModel string) (account.RoutingOverlaySnapshot, error) {
+func (r *AccountRepository) ListRoutingAccountOverlays(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel string) (account.RoutingOverlaySnapshot, error) {
 	upstreamModel = strings.TrimSpace(upstreamModel)
 	if upstreamModel == "" {
 		return account.RoutingOverlaySnapshot{}, nil
 	}
-	var boundIDs []uint64
-	if err := r.db.db.WithContext(ctx).
-		Table("model_route_accounts AS binding").
-		Select("binding.account_id").
-		Joins("JOIN model_routes AS route ON route.id = binding.model_route_id").
-		Where("route.provider = ? AND route.upstream_model = ?", provider, upstreamModel).
-		Scan(&boundIDs).Error; err != nil {
+	boundIDs, err := r.listRoutingBoundAccountIDs(ctx, provider, modelRouteID, upstreamModel)
+	if err != nil {
 		return account.RoutingOverlaySnapshot{}, err
 	}
 	values := make(map[uint64]account.RoutingAccountOverlay)
@@ -441,6 +433,23 @@ func (r *AccountRepository) ListRoutingAccountOverlays(ctx context.Context, prov
 		result.Values = append(result.Values, value)
 	}
 	return result, nil
+}
+
+func (r *AccountRepository) listRoutingBoundAccountIDs(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel string) ([]uint64, error) {
+	query := r.db.db.WithContext(ctx).
+		Table("model_route_accounts AS binding").
+		Select("binding.account_id").
+		Joins("JOIN model_routes AS route ON route.id = binding.model_route_id")
+	if modelRouteID > 0 {
+		query = query.Where("route.id = ? AND route.provider = ? AND route.upstream_model = ?", modelRouteID, provider, upstreamModel)
+	} else {
+		query = query.Where("route.provider = ? AND route.upstream_model = ?", provider, upstreamModel)
+	}
+	var accountIDs []uint64
+	if err := query.Scan(&accountIDs).Error; err != nil {
+		return nil, err
+	}
+	return accountIDs, nil
 }
 
 func (r *AccountRepository) ListEnabled(ctx context.Context, provider account.Provider) ([]account.Credential, error) {
@@ -1499,6 +1508,53 @@ func applyAccountStatusFilter(query *gorm.DB, status string, now time.Time) *gor
 	}
 }
 
+// Web agreement predicates match the effective state exposed by the admin API.
+// Terms are current only when the recorded version reaches CurrentWebTermsVersion.
+const (
+	webNSFWEnabledPredicate   = "EXISTS (SELECT 1 FROM web_account_profiles profile WHERE profile.account_id = provider_accounts.id AND profile.nsfw_enabled_at IS NOT NULL)"
+	webTermsAcceptedPredicate = "EXISTS (SELECT 1 FROM web_account_profiles profile WHERE profile.account_id = provider_accounts.id AND profile.terms_accepted_at IS NOT NULL AND profile.terms_accepted_version >= ?)"
+	webBuildLinkedPredicate   = "EXISTS (SELECT 1 FROM account_provider_links link WHERE link.web_account_id = provider_accounts.id)"
+	webConsoleLinkedPredicate = "EXISTS (SELECT 1 FROM web_console_account_links link WHERE link.web_account_id = provider_accounts.id)"
+)
+
+func applyWebAgreementFilter(query *gorm.DB, agreement string) *gorm.DB {
+	switch agreement {
+	case "nsfwEnabled":
+		return query.Where(webNSFWEnabledPredicate)
+	case "nsfwDisabled":
+		return query.Where("NOT " + webNSFWEnabledPredicate)
+	case "termsAccepted":
+		return query.Where(webTermsAcceptedPredicate, account.CurrentWebTermsVersion)
+	case "termsNotAccepted":
+		return query.Where("NOT "+webTermsAcceptedPredicate, account.CurrentWebTermsVersion)
+	case "allAccepted":
+		return query.Where(webNSFWEnabledPredicate).Where(webTermsAcceptedPredicate, account.CurrentWebTermsVersion)
+	case "allNotAccepted":
+		return query.Where("NOT "+webNSFWEnabledPredicate).Where("NOT "+webTermsAcceptedPredicate, account.CurrentWebTermsVersion)
+	default:
+		return query
+	}
+}
+
+func applyWebAssociationFilter(query *gorm.DB, association string) *gorm.DB {
+	switch association {
+	case "buildLinked":
+		return query.Where(webBuildLinkedPredicate)
+	case "buildUnlinked":
+		return query.Where("NOT " + webBuildLinkedPredicate)
+	case "consoleLinked":
+		return query.Where(webConsoleLinkedPredicate)
+	case "consoleUnlinked":
+		return query.Where("NOT " + webConsoleLinkedPredicate)
+	case "allLinked":
+		return query.Where(webBuildLinkedPredicate).Where(webConsoleLinkedPredicate)
+	case "allUnlinked":
+		return query.Where("NOT " + webBuildLinkedPredicate).Where("NOT " + webConsoleLinkedPredicate)
+	default:
+		return query
+	}
+}
+
 func (r *AccountRepository) UpdateTokens(ctx context.Context, id uint64, accessToken, refreshToken string, expiresAt time.Time) (account.Credential, error) {
 	now := time.Now().UTC()
 	refreshDueAt := account.CredentialRefreshDueAt(id, expiresAt)
@@ -1817,6 +1873,48 @@ func (r *AccountRepository) ClearQuotaRecovery(ctx context.Context, accountID ui
 		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountRecoveryChanged, AccountID: accountID})
 	}
 	return err
+}
+
+func (r *AccountRepository) ResetQuotaState(ctx context.Context, provider account.Provider, accountIDs []uint64) error {
+	if len(accountIDs) == 0 {
+		return nil
+	}
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("account_id IN ?", accountIDs).Delete(&quotaRecoveryModel{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("account_id IN ? AND reason = ?", accountIDs, "model_quota_depleted").Delete(&accountModelQuotaBlockModel{}).Error
+	})
+	if err == nil {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountRecoveryChanged, Provider: provider})
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountModelQuotaChanged, Provider: provider})
+	}
+	return err
+}
+
+func (r *AccountRepository) ResetProviderQuotaState(ctx context.Context, provider account.Provider, activeOnly bool) (int64, error) {
+	var accountCount int64
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		accountQuery := func() *gorm.DB {
+			query := tx.Model(&accountModel{}).Where("provider = ?", provider)
+			if activeOnly {
+				query = query.Where("enabled = ? AND auth_status = ?", true, account.AuthStatusActive)
+			}
+			return query
+		}
+		if err := accountQuery().Count(&accountCount).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("account_id IN (?)", accountQuery().Select("id")).Delete(&quotaRecoveryModel{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("account_id IN (?) AND reason = ?", accountQuery().Select("id"), "model_quota_depleted").Delete(&accountModelQuotaBlockModel{}).Error
+	})
+	if err == nil && accountCount > 0 {
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountRecoveryChanged, Provider: provider})
+		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountModelQuotaChanged, Provider: provider})
+	}
+	return accountCount, err
 }
 
 func (r *AccountRepository) HasQuotaWindows(ctx context.Context, accountID uint64) (bool, error) {

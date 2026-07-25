@@ -3,11 +3,13 @@ package relational
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/media"
+	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
 	"gorm.io/gorm"
 )
 
@@ -61,7 +63,7 @@ var schemaIndexes = []string{
 	"CREATE INDEX IF NOT EXISTS idx_account_credentials_refresh_due ON account_credentials(refresh_due_at, account_id)",
 	"CREATE INDEX IF NOT EXISTS idx_quota_windows_due ON account_quota_windows(remaining, reset_at, account_id)",
 	"CREATE UNIQUE INDEX IF NOT EXISTS idx_model_routes_public_id ON model_routes(public_id)",
-	"CREATE UNIQUE INDEX IF NOT EXISTS uidx_provider_upstream ON model_routes(provider, upstream_model)",
+	"CREATE INDEX IF NOT EXISTS idx_model_routes_provider_upstream ON model_routes(provider, upstream_model)",
 	"CREATE INDEX IF NOT EXISTS idx_model_routes_created_id ON model_routes(created_at DESC, id DESC)",
 	"CREATE INDEX IF NOT EXISTS idx_model_routes_enabled ON model_routes(enabled, public_id, id)",
 	"CREATE INDEX IF NOT EXISTS idx_model_route_aliases_route ON model_route_aliases(model_route_id, alias)",
@@ -132,6 +134,9 @@ func (d *Database) initializeSchema(ctx context.Context) error {
 	if migrateErr != nil {
 		return fmt.Errorf("初始化数据库表: %w", migrateErr)
 	}
+	if err := d.migrateBuildResponseHeaderTimeout(ctx); err != nil {
+		return fmt.Errorf("迁移 Grok Build 响应头超时: %w", err)
+	}
 	if err := d.ensureConsoleConstraints(ctx); err != nil {
 		return fmt.Errorf("迁移 Console 数据库约束: %w", err)
 	}
@@ -170,6 +175,9 @@ func (d *Database) initializeSchema(ctx context.Context) error {
 	if err := d.dropRedundantResponseExpiryIndexes(ctx); err != nil {
 		return fmt.Errorf("迁移响应过期索引: %w", err)
 	}
+	if err := d.dropProviderUpstreamUniqueIndex(ctx); err != nil {
+		return fmt.Errorf("迁移模型路由上游唯一约束: %w", err)
+	}
 	for _, statement := range schemaIndexes {
 		if err := db.Exec(statement).Error; err != nil {
 			return fmt.Errorf("初始化数据库索引: %w", err)
@@ -181,11 +189,56 @@ func (d *Database) initializeSchema(ctx context.Context) error {
 	return nil
 }
 
+// migrateBuildResponseHeaderTimeout persists the runtime default for settings
+// rows created before the Build response-header timeout became configurable.
+func (d *Database) migrateBuildResponseHeaderTimeout(ctx context.Context) error {
+	db := d.db.WithContext(ctx)
+	for range 4 {
+		var row runtimeSettingsModel
+		if err := db.Where("key = ?", runtimeSettingsKey).First(&row).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		var payload runtimeSettingsPayload
+		if err := json.Unmarshal([]byte(row.ValueJSON), &payload); err != nil {
+			return fmt.Errorf("decode runtime settings: %w", err)
+		}
+		if payload.Config.ProviderBuild.ResponseHeaderTimeout > 0 {
+			return nil
+		}
+		payload.Config.ProviderBuild.ResponseHeaderTimeout = settingsdomain.DefaultBuildResponseHeaderTimeout
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("encode runtime settings: %w", err)
+		}
+		result := db.Model(&runtimeSettingsModel{}).
+			Where("key = ? AND revision = ?", row.Key, row.Revision).
+			UpdateColumn("value_json", string(encoded))
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 1 {
+			return nil
+		}
+	}
+	return errors.New("runtime settings changed repeatedly during migration")
+}
+
 func (d *Database) dropRedundantResponseExpiryIndexes(ctx context.Context) error {
 	for _, name := range []string{"idx_response_ownership_expires", "idx_web_response_states_expires"} {
 		if err := d.db.WithContext(ctx).Exec("DROP INDEX IF EXISTS " + name).Error; err != nil {
 			return fmt.Errorf("drop index %s: %w", name, err)
 		}
+	}
+	return nil
+}
+
+// dropProviderUpstreamUniqueIndex 允许同一 Provider 下多条对外名映射到同一上游模型。
+func (d *Database) dropProviderUpstreamUniqueIndex(ctx context.Context) error {
+	if err := d.db.WithContext(ctx).Exec("DROP INDEX IF EXISTS uidx_provider_upstream").Error; err != nil {
+		return fmt.Errorf("drop index uidx_provider_upstream: %w", err)
 	}
 	return nil
 }

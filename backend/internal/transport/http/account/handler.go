@@ -148,9 +148,11 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/accounts/web/:id/nsfw", h.enableWebNSFW)
 	router.POST("/accounts/console/refresh-quotas", h.refreshAllConsoleQuotas)
 	router.POST("/accounts/refresh-billing", h.refreshAllBilling)
+	router.POST("/accounts/reset-quota", h.resetAllBuildQuota)
 	router.POST("/accounts/refresh-tokens", h.refreshAllTokens)
 	router.POST("/accounts/cleanup", h.cleanup)
 	router.POST("/accounts/batch/refresh-billing", h.batchRefreshBilling)
+	router.POST("/accounts/batch/reset-quota", h.batchResetQuota)
 	router.POST("/accounts/batch/refresh-quotas", h.batchRefreshQuotas)
 	router.POST("/accounts/batch/refresh-tokens", h.batchRefreshTokens)
 	router.PATCH("/accounts/batch", h.batchUpdate)
@@ -366,7 +368,11 @@ type quotaResponse struct {
 
 func (h *Handler) list(c *gin.Context) {
 	page, pageSize := pagination(c)
-	values, total, err := h.service.List(c.Request.Context(), page, pageSize, c.Query("search"), accountapp.ListFilter{Provider: c.Query("provider"), QuotaType: c.Query("type"), Status: c.Query("status"), Egress: c.Query("egress"), Renewal: c.Query("renewal"), Risk: c.Query("risk"), Sort: repository.SortQuery{Field: c.Query("sortBy"), Direction: repository.SortDirection(c.Query("sortOrder"))}})
+	values, total, err := h.service.List(c.Request.Context(), page, pageSize, c.Query("search"), accountapp.ListFilter{
+		Provider: c.Query("provider"), QuotaType: c.Query("type"), Status: c.Query("status"), Egress: c.Query("egress"),
+		Renewal: c.Query("renewal"), Risk: c.Query("risk"), Agreement: c.Query("agreement"), Association: c.Query("association"),
+		Sort: repository.SortQuery{Field: c.Query("sortBy"), Direction: repository.SortDirection(c.Query("sortOrder"))},
+	})
 	if errors.Is(err, accountapp.ErrInvalidFilter) {
 		response.Error(c, http.StatusBadRequest, "invalidFilter", err.Error())
 		return
@@ -471,6 +477,38 @@ func (h *Handler) batchRefreshBilling(c *gin.Context) {
 		return
 	}
 	response.Success(c, http.StatusOK, gin.H{"succeeded": succeeded, "failed": failed})
+}
+
+func (h *Handler) batchResetQuota(c *gin.Context) {
+	var request batchDeleteRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	ids, err := parseIDs(request.IDs)
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidId", err.Error())
+		return
+	}
+	if request.Provider != string(accountdomain.ProviderBuild) {
+		response.Error(c, http.StatusBadRequest, "invalidProvider", "仅 Grok Build 账号支持手动重置额度状态")
+		return
+	}
+	reset, err := h.service.BatchResetQuotaState(c.Request.Context(), ids)
+	if err != nil {
+		h.writeServiceError(c, "quotaBatchResetFailed", err, http.StatusInternalServerError, "批量重置额度状态失败")
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"reset": reset})
+}
+
+func (h *Handler) resetAllBuildQuota(c *gin.Context) {
+	reset, err := h.service.ResetAllBuildQuotaState(c.Request.Context())
+	if err != nil {
+		h.writeServiceError(c, "quotaResetFailed", err, http.StatusInternalServerError, "重置全部 Grok Build 额度状态失败")
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"reset": reset})
 }
 
 func (h *Handler) cleanup(c *gin.Context) {
@@ -845,11 +883,11 @@ func writeAccountEvent(c *gin.Context, event string, value any) error {
 }
 
 func (h *Handler) importFile(c *gin.Context, providerValue accountdomain.Provider) {
-	fileDescription := "账号凭据 JSON"
+	fileDescription := "账号凭据 JSON 或逐行 JSON 文本"
 	if providerValue == accountdomain.ProviderWeb {
-		fileDescription = "Grok Web JSON 或 SSO 文本"
+		fileDescription = "Grok Web JSON、逐行 JSON 或 SSO 文本"
 	} else if providerValue == accountdomain.ProviderConsole {
-		fileDescription = "Grok Console JSON 或 SSO 文本"
+		fileDescription = "Grok Console JSON、逐行 JSON 或 SSO 文本"
 	}
 	documents, ok := readAccountImportDocuments(c, fileDescription)
 	if !ok {

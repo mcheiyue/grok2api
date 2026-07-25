@@ -9,10 +9,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
+	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
 	"github.com/chenyme/grok2api/backend/internal/pkg/signerurl"
 	"gopkg.in/yaml.v3"
 )
@@ -24,7 +26,7 @@ const (
 	ClearanceModeFlareSolverr     = "flaresolverr"
 	DefaultStatsigSignerURL       = "https://grok.wodf.de/sign"
 	DefaultFlareSolverrURL        = "http://flaresolverr:8191"
-	RecommendedBuildClientVersion = "0.2.106"
+	RecommendedBuildClientVersion = "0.2.111"
 	RecommendedBuildUserAgent     = "grok-shell/" + RecommendedBuildClientVersion + " (linux; x86_64)"
 
 	maxServerBodyBytes    = 256 << 20
@@ -40,6 +42,8 @@ const (
 	maxAuditBatchSize     = 4096
 	maxDeploymentReplicas = 1024
 )
+
+var buildForbiddenCodePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
 // Config 表示后端运行配置。
 type Config struct {
@@ -137,12 +141,13 @@ type ProviderConfig struct {
 }
 
 type BuildProviderConfig struct {
-	BaseURL          string `yaml:"baseURL"`
-	FallbackBaseURL  string `yaml:"fallbackBaseURL"`
-	ClientVersion    string `yaml:"clientVersion"`
-	ClientIdentifier string `yaml:"clientIdentifier"`
-	TokenAuth        string `yaml:"tokenAuth"`
-	UserAgent        string `yaml:"userAgent"`
+	BaseURL               string   `yaml:"baseURL"`
+	FallbackBaseURL       string   `yaml:"fallbackBaseURL"`
+	ClientVersion         string   `yaml:"clientVersion"`
+	ClientIdentifier      string   `yaml:"clientIdentifier"`
+	TokenAuth             string   `yaml:"tokenAuth"`
+	UserAgent             string   `yaml:"userAgent"`
+	ResponseHeaderTimeout Duration `yaml:"-"`
 }
 
 // DefaultBuildFallbackBaseURL 是主 Build API 对可回退推理操作 403 时探测的 XAI API 根地址。
@@ -232,10 +237,12 @@ type ClientKeyDefaultsConfig struct {
 
 // AccountsConfig 定义可热加载的账号池维护策略；默认全部关闭。
 type AccountsConfig struct {
-	AutoCleanReauthEnabled   bool
-	AutoCleanReauthInterval  Duration
-	AutoCleanReauthMinAge    Duration
-	AutoCleanIncludeDisabled bool
+	MarkBuildForbiddenReauth  bool
+	BuildForbiddenReauthCodes []string
+	AutoCleanReauthEnabled    bool
+	AutoCleanReauthInterval   Duration
+	AutoCleanReauthMinAge     Duration
+	AutoCleanIncludeDisabled  bool
 }
 
 type Secrets struct {
@@ -461,6 +468,9 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.Provider.Build.ClientVersion) == "" || strings.TrimSpace(c.Provider.Build.ClientIdentifier) == "" || strings.TrimSpace(c.Provider.Build.TokenAuth) == "" || strings.TrimSpace(c.Provider.Build.UserAgent) == "" {
 		return errors.New("provider.build 客户端标识不能为空")
 	}
+	if timeout := c.Provider.Build.ResponseHeaderTimeout.Value(); timeout < settingsdomain.MinBuildResponseHeaderTimeout || timeout > settingsdomain.MaxBuildResponseHeaderTimeout {
+		return errors.New("Grok Build 响应头超时必须在 30 秒到 30 分钟之间")
+	}
 	webURL, err := url.ParseRequestURI(strings.TrimSpace(c.Provider.Web.BaseURL))
 	if err != nil || webURL.Scheme != "https" || webURL.Host == "" || webURL.User != nil {
 		return errors.New("provider.web.baseURL 必须是无凭据的 HTTPS URL")
@@ -566,6 +576,17 @@ func (c Config) Validate() error {
 	if c.Accounts.AutoCleanReauthMinAge.Value() < time.Minute || c.Accounts.AutoCleanReauthMinAge.Value() > 30*24*time.Hour {
 		return errors.New("accounts.autoCleanReauthMinAge 必须在 1 分钟到 30 天之间")
 	}
+	if len(c.Accounts.BuildForbiddenReauthCodes) > 32 {
+		return errors.New("accounts.buildForbiddenReauthCodes 最多支持 32 个错误码")
+	}
+	for _, code := range c.Accounts.BuildForbiddenReauthCodes {
+		if !buildForbiddenCodePattern.MatchString(strings.TrimSpace(code)) {
+			return errors.New("accounts.buildForbiddenReauthCodes 包含无效错误码")
+		}
+	}
+	if len(c.Accounts.BuildForbiddenReauthCodes) == 0 {
+		return errors.New("accounts.buildForbiddenReauthCodes 至少需要一个错误码")
+	}
 	return nil
 }
 
@@ -625,7 +646,7 @@ func defaultConfig() Config {
 			Build: BuildProviderConfig{
 				BaseURL: "https://cli-chat-proxy.grok.com/v1", FallbackBaseURL: DefaultBuildFallbackBaseURL,
 				ClientVersion: RecommendedBuildClientVersion, ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli",
-				UserAgent: RecommendedBuildUserAgent,
+				UserAgent: RecommendedBuildUserAgent, ResponseHeaderTimeout: Duration(settingsdomain.DefaultBuildResponseHeaderTimeout),
 			},
 			Web: WebProviderConfig{
 				BaseURL: "https://grok.com", StatsigMode: StatsigModeURL, StatsigSignerURL: DefaultStatsigSignerURL,
@@ -672,10 +693,12 @@ Console: ConsoleProviderConfig{
 		},
 		ClientKeyDefaults: ClientKeyDefaultsConfig{RPMLimit: clientkeydomain.DefaultRPMLimit, MaxConcurrent: clientkeydomain.DefaultMaxConcurrent},
 		Accounts: AccountsConfig{
-			AutoCleanReauthEnabled:   false,
-			AutoCleanReauthInterval:  Duration(10 * time.Minute),
-			AutoCleanReauthMinAge:    Duration(time.Hour),
-			AutoCleanIncludeDisabled: false,
+			MarkBuildForbiddenReauth:  false,
+			BuildForbiddenReauthCodes: []string{"permission-denied"},
+			AutoCleanReauthEnabled:    false,
+			AutoCleanReauthInterval:   Duration(10 * time.Minute),
+			AutoCleanReauthMinAge:     Duration(time.Hour),
+			AutoCleanIncludeDisabled:  false,
 		},
 	}
 }

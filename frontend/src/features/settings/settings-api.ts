@@ -4,7 +4,7 @@ import type { SortOrder } from "@/shared/lib/table-sort";
 
 export type SettingsConfigDTO = {
   server: { maxConcurrentRequests: number };
-  providerBuild: { baseURL: string; fallbackBaseURL: string; clientVersion: string; clientIdentifier: string; tokenAuth: string; tokenAuthConfigured: boolean; userAgent: string };
+  providerBuild: { baseURL: string; fallbackBaseURL: string; clientVersion: string; clientIdentifier: string; tokenAuth: string; tokenAuthConfigured: boolean; userAgent: string; responseHeaderTimeout: string };
   providerWeb: {
     baseURL: string; quotaTimeout: string; chatTimeout: string; imageTimeout: string; videoTimeout: string;
     statsigMode: "manual" | "url"; statsigManualValue?: string; statsigManualConfigured: boolean; statsigSignerURL: string;
@@ -26,6 +26,8 @@ export type SettingsConfigDTO = {
   audit: { bufferSize: number; batchSize: number; flushInterval: string; commitDelayMS: number };
   clientKeyDefaults: { rpmLimit: number; maxConcurrent: number };
   accounts: {
+    markBuildForbiddenReauth: boolean;
+    buildForbiddenReauthCodes: string[];
     autoCleanReauthEnabled: boolean;
     autoCleanReauthInterval: string;
     autoCleanReauthMinAge: string;
@@ -79,7 +81,7 @@ export type SettingsSnapshotDTO = {
 
 const settingsConfigValidator = hasShape({
   server: hasShape({ maxConcurrentRequests: isNumber }),
-  providerBuild: hasShape({ baseURL: isString, fallbackBaseURL: isString, clientVersion: isString, clientIdentifier: isString, tokenAuth: isString, tokenAuthConfigured: isBoolean, userAgent: isString }),
+  providerBuild: hasShape({ baseURL: isString, fallbackBaseURL: isString, clientVersion: isString, clientIdentifier: isString, tokenAuth: isString, tokenAuthConfigured: isBoolean, userAgent: isString, responseHeaderTimeout: isString }),
   providerWeb: hasShape({
     baseURL: isString, quotaTimeout: isString, chatTimeout: isString, imageTimeout: isString, videoTimeout: isString,
     statsigMode: isOneOf("manual", "url"), statsigManualValue: isOptional(isString), statsigManualConfigured: isBoolean,
@@ -96,8 +98,10 @@ const settingsConfigValidator = hasShape({
   }),
   audit: hasShape({ bufferSize: isNumber, batchSize: isNumber, flushInterval: isString, commitDelayMS: isOptional(isNumber) }),
   clientKeyDefaults: hasShape({ rpmLimit: isNumber, maxConcurrent: isNumber }),
-  // 旧后端可无 accounts；decode 后由 withAccountsDefaults 补默认关闭策略。
+  // Older backends may omit accounts; withSettingsDefaults supplies a safe local default.
   accounts: isOptional(hasShape({
+    markBuildForbiddenReauth: isOptional(isBoolean),
+    buildForbiddenReauthCodes: isOptional(isArrayOf(isString)),
     autoCleanReauthEnabled: isBoolean,
     autoCleanReauthInterval: isString,
     autoCleanReauthMinAge: isString,
@@ -105,6 +109,8 @@ const settingsConfigValidator = hasShape({
   })),
 });
 const defaultAccountsConfig = (): SettingsConfigDTO["accounts"] => ({
+  markBuildForbiddenReauth: false,
+  buildForbiddenReauthCodes: ["permission-denied"],
   autoCleanReauthEnabled: false,
   autoCleanReauthInterval: "10m",
   autoCleanReauthMinAge: "1h",
@@ -130,6 +136,8 @@ function withSettingsDefaults(snapshot: SettingsSnapshotDTO): SettingsSnapshotDT
         },
       },
       accounts: {
+        markBuildForbiddenReauth: accounts.markBuildForbiddenReauth ?? false,
+        buildForbiddenReauthCodes: accounts.buildForbiddenReauthCodes ?? ["permission-denied"],
         autoCleanReauthEnabled: accounts.autoCleanReauthEnabled ?? false,
         autoCleanReauthInterval: accounts.autoCleanReauthInterval || "10m",
         autoCleanReauthMinAge: accounts.autoCleanReauthMinAge || "1h",

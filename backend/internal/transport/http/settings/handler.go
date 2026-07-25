@@ -55,13 +55,14 @@ type frontendConfigDTO struct {
 }
 
 type providerBuildConfigDTO struct {
-	BaseURL             string `json:"baseURL"`
-	FallbackBaseURL     string `json:"fallbackBaseURL"`
-	ClientVersion       string `json:"clientVersion"`
-	ClientIdentifier    string `json:"clientIdentifier"`
-	TokenAuth           string `json:"tokenAuth"`
-	TokenAuthConfigured bool   `json:"tokenAuthConfigured"`
-	UserAgent           string `json:"userAgent"`
+	BaseURL               string `json:"baseURL"`
+	FallbackBaseURL       string `json:"fallbackBaseURL"`
+	ClientVersion         string `json:"clientVersion"`
+	ClientIdentifier      string `json:"clientIdentifier"`
+	TokenAuth             string `json:"tokenAuth"`
+	TokenAuthConfigured   bool   `json:"tokenAuthConfigured"`
+	UserAgent             string `json:"userAgent"`
+	ResponseHeaderTimeout string `json:"responseHeaderTimeout"`
 }
 
 type providerWebConfigDTO struct {
@@ -121,10 +122,12 @@ type clientKeyDefaultsConfigDTO struct {
 }
 
 type accountsConfigDTO struct {
-	AutoCleanReauthEnabled   bool   `json:"autoCleanReauthEnabled"`
-	AutoCleanReauthInterval  string `json:"autoCleanReauthInterval"`
-	AutoCleanReauthMinAge    string `json:"autoCleanReauthMinAge"`
-	AutoCleanIncludeDisabled bool   `json:"autoCleanIncludeDisabled"`
+	MarkBuildForbiddenReauth  *bool     `json:"markBuildForbiddenReauth,omitempty"`
+	BuildForbiddenReauthCodes *[]string `json:"buildForbiddenReauthCodes,omitempty"`
+	AutoCleanReauthEnabled    bool      `json:"autoCleanReauthEnabled"`
+	AutoCleanReauthInterval   string    `json:"autoCleanReauthInterval"`
+	AutoCleanReauthMinAge     string    `json:"autoCleanReauthMinAge"`
+	AutoCleanIncludeDisabled  bool      `json:"autoCleanIncludeDisabled"`
 }
 
 type settingsResponse struct {
@@ -180,6 +183,7 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
 			BaseURL: value.ProviderBuild.BaseURL, FallbackBaseURL: value.ProviderBuild.FallbackBaseURL,
 			ClientVersion: value.ProviderBuild.ClientVersion, ClientIdentifier: value.ProviderBuild.ClientIdentifier,
 			TokenAuth: value.ProviderBuild.TokenAuth, UserAgent: value.ProviderBuild.UserAgent,
+			ResponseHeaderTimeout: value.ProviderBuild.ResponseHeaderTimeout,
 		},
 		ProviderWeb: settingsapp.ProviderWebConfig{
 			BaseURL: value.ProviderWeb.BaseURL, QuotaTimeout: value.ProviderWeb.QuotaTimeout,
@@ -229,10 +233,14 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
 	}
 	if value.Accounts != nil {
 		result.Accounts = settingsapp.AccountsConfig{
-			AutoCleanReauthEnabled:   value.Accounts.AutoCleanReauthEnabled,
-			AutoCleanReauthInterval:  value.Accounts.AutoCleanReauthInterval,
-			AutoCleanReauthMinAge:    value.Accounts.AutoCleanReauthMinAge,
-			AutoCleanIncludeDisabled: value.Accounts.AutoCleanIncludeDisabled,
+			MarkBuildForbiddenReauth:          boolValue(value.Accounts.MarkBuildForbiddenReauth),
+			BuildForbiddenReauthCodes:         stringSliceValue(value.Accounts.BuildForbiddenReauthCodes),
+			MarkBuildForbiddenReauthProvided:  value.Accounts.MarkBuildForbiddenReauth != nil,
+			BuildForbiddenReauthCodesProvided: value.Accounts.BuildForbiddenReauthCodes != nil,
+			AutoCleanReauthEnabled:            value.Accounts.AutoCleanReauthEnabled,
+			AutoCleanReauthInterval:           value.Accounts.AutoCleanReauthInterval,
+			AutoCleanReauthMinAge:             value.Accounts.AutoCleanReauthMinAge,
+			AutoCleanIncludeDisabled:          value.Accounts.AutoCleanIncludeDisabled,
 		}
 		result.AccountsProvided = true
 	}
@@ -249,6 +257,7 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 				ClientVersion: config.ProviderBuild.ClientVersion, ClientIdentifier: config.ProviderBuild.ClientIdentifier,
 				TokenAuth:           config.ProviderBuild.TokenAuth,
 				TokenAuthConfigured: strings.TrimSpace(config.ProviderBuild.TokenAuth) != "", UserAgent: config.ProviderBuild.UserAgent,
+				ResponseHeaderTimeout: config.ProviderBuild.ResponseHeaderTimeout,
 			},
 			ProviderWeb: providerWebConfigDTO{
 				BaseURL: config.ProviderWeb.BaseURL, QuotaTimeout: config.ProviderWeb.QuotaTimeout,
@@ -292,10 +301,12 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 				RPMLimit: config.ClientKeyDefaults.RPMLimit, MaxConcurrent: config.ClientKeyDefaults.MaxConcurrent,
 			},
 			Accounts: &accountsConfigDTO{
-				AutoCleanReauthEnabled:   config.Accounts.AutoCleanReauthEnabled,
-				AutoCleanReauthInterval:  config.Accounts.AutoCleanReauthInterval,
-				AutoCleanReauthMinAge:    config.Accounts.AutoCleanReauthMinAge,
-				AutoCleanIncludeDisabled: config.Accounts.AutoCleanIncludeDisabled,
+				MarkBuildForbiddenReauth:  boolPointer(config.Accounts.MarkBuildForbiddenReauth),
+				BuildForbiddenReauthCodes: stringSlicePointer(config.Accounts.BuildForbiddenReauthCodes),
+				AutoCleanReauthEnabled:    config.Accounts.AutoCleanReauthEnabled,
+				AutoCleanReauthInterval:   config.Accounts.AutoCleanReauthInterval,
+				AutoCleanReauthMinAge:     config.Accounts.AutoCleanReauthMinAge,
+				AutoCleanIncludeDisabled:  config.Accounts.AutoCleanIncludeDisabled,
 			},
 		},
 		RecommendedProviderBuild: providerBuildRecommendationDTO{
@@ -314,3 +325,24 @@ func optionalString(value *string) string {
 }
 
 func stringPointer(value string) *string { return &value }
+
+func boolPointer(value bool) *bool { return &value }
+
+func boolValue(value *bool) bool {
+	if value == nil {
+		return false
+	}
+	return *value
+}
+
+func stringSliceValue(value *[]string) []string {
+	if value == nil {
+		return nil
+	}
+	return append([]string(nil), (*value)...)
+}
+
+func stringSlicePointer(value []string) *[]string {
+	cloned := append([]string(nil), value...)
+	return &cloned
+}

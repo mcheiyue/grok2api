@@ -20,7 +20,9 @@ import (
 	application "github.com/chenyme/grok2api/backend/internal/application/egress"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	domain "github.com/chenyme/grok2api/backend/internal/domain/egress"
+	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 	"golang.org/x/sync/singleflight"
 )
@@ -68,16 +70,35 @@ type requestClient interface {
 }
 
 func (l *Lease) Do(request *http.Request) (*http.Response, error) {
+	return l.doRequest(request, true)
+}
+
+// DoDeferredForbidden executes an HTTP request while leaving 403 clearance
+// invalidation to the caller after it has classified the response body.
+func (l *Lease) DoDeferredForbidden(request *http.Request) (*http.Response, error) {
+	return l.doRequest(request, false)
+}
+
+func (l *Lease) doRequest(request *http.Request, invalidateForbidden bool) (*http.Response, error) {
 	if l == nil || l.client == nil {
 		return nil, errors.New("出口客户端未初始化")
 	}
 	response, err := l.do(request)
 	recordPhysicalCall(request.Context(), response, err)
-	if err == nil && response != nil && response.StatusCode == http.StatusForbidden && l.clearanceManager != nil && l.clearanceKey != "" {
-		l.clearanceManager.invalidateClearanceKey(l.clearanceKey, l.client)
+	if invalidateForbidden && err == nil && response != nil && response.StatusCode == http.StatusForbidden {
+		l.InvalidateClearance()
 	}
 	return response, err
 }
+
+// InvalidateClearance invalidates the exact browser-session binding used by
+// this lease after a 403 has been classified as egress-related.
+func (l *Lease) InvalidateClearance() {
+	if l != nil && l.clearanceManager != nil && l.clearanceKey != "" {
+		l.clearanceManager.invalidateClearanceKey(l.clearanceKey, l.client)
+	}
+}
+
 func (l *Lease) Release() {
 	if l != nil && l.release != nil {
 		l.release()
@@ -101,6 +122,7 @@ type Manager struct {
 	clientLoads          singleflight.Group
 	clientVersions       map[uint64]uint64
 	clientGeneration     uint64
+	buildHeaderTimeout   atomic.Int64
 	operationsConfig     cachedOperationsConfig
 	operationsConfigLoad singleflight.Group
 	operationsConfigVer  uint64
@@ -112,7 +134,7 @@ type Manager struct {
 	lastClearanceCleanup time.Time
 	solver               clearanceSolver
 	clearanceLock        repository.DistributedLock
-	newBuildClient       func(string) (requestClient, error)
+	newBuildClient       func(string, time.Duration) (requestClient, error)
 	newBrowserClient     func(string, string) (*browserClient, error)
 }
 
@@ -164,7 +186,7 @@ type cachedOperationsConfig struct {
 }
 
 func NewManager(repository repository.EgressRepository, cipher *security.Cipher) *Manager {
-	return &Manager{
+	manager := &Manager{
 		repository: repository, cipher: cipher,
 		clients: make(map[clientCacheKey]cachedClient),
 		nodes:   make(map[domain.Scope]cachedNodeSnapshot), healthyNodes: make(map[uint64]time.Time),
@@ -173,6 +195,28 @@ func NewManager(repository repository.EgressRepository, cipher *security.Cipher)
 		solver:          flaresolverrSolver{},
 		clearanceConfig: ClearanceConfig{Mode: "manual", TargetURL: "https://grok.com", Timeout: time.Minute, RefreshInterval: 10 * time.Minute},
 	}
+	manager.buildHeaderTimeout.Store(int64(settingsdomain.DefaultBuildResponseHeaderTimeout))
+	return manager
+}
+
+// UpdateBuildResponseHeaderTimeout rebuilds only cached Build clients. Active
+// requests keep their current transport and are not interrupted.
+func (m *Manager) UpdateBuildResponseHeaderTimeout(value time.Duration) {
+	if value <= 0 {
+		value = settingsdomain.DefaultBuildResponseHeaderTimeout
+	}
+	if previous := time.Duration(m.buildHeaderTimeout.Swap(int64(value))); previous == value {
+		return
+	}
+	m.clientMu.Lock()
+	var stale []requestClient
+	for key, cached := range m.clients {
+		if key.scope == domain.ScopeBuild {
+			stale = append(stale, m.evictClientLocked(key, cached))
+		}
+	}
+	m.clientMu.Unlock()
+	closeRequestClients(stale)
 }
 
 // SetClearanceLock enables cross-instance coordination for shared, fixed egress
@@ -275,7 +319,7 @@ func (m *Manager) probeEgressNode(ctx context.Context, nodeID uint64, targetURL 
 			return result, err
 		}
 	}
-	client, err := newBuildClient(proxyURL)
+	client, err := newBuildClient(proxyURL, egressProbeTimeout)
 	if err != nil {
 		result.Error = "创建代理连接失败"
 		return result, err
@@ -836,8 +880,14 @@ func (m *Manager) inflightCount(nodeID uint64) int64 {
 
 func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, cookies string, sticky bool) (cachedClient, error) {
 	clientKind := "browser"
+	buildHeaderTimeout := time.Duration(0)
 	if scope == domain.ScopeBuild {
 		clientKind = "build"
+		buildHeaderTimeout = time.Duration(m.buildHeaderTimeout.Load())
+		if buildHeaderTimeout <= 0 {
+			buildHeaderTimeout = settingsdomain.DefaultBuildResponseHeaderTimeout
+		}
+		clientKind += "\x00" + strconv.FormatInt(int64(buildHeaderTimeout), 10)
 	}
 	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(clientKind+"\x00"+proxyURL+"\x00"+userAgent+"\x00"+cookies)))
 	cacheScope := scope
@@ -870,7 +920,7 @@ func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, 
 		closeRequestClients(stale)
 
 		loaded, err, _ := m.clientLoads.Do(loadKey, func() (any, error) {
-			return m.createAndCacheClient(key, id, scope, proxyURL, userAgent, sticky)
+			return m.createAndCacheClient(key, id, scope, proxyURL, userAgent, sticky, buildHeaderTimeout)
 		})
 		if errors.Is(err, errClientCacheInvalidated) {
 			continue
@@ -883,7 +933,7 @@ func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, 
 	return cachedClient{}, errClientCacheInvalidated
 }
 
-func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope domain.Scope, proxyURL, userAgent string, sticky bool) (cachedClient, error) {
+func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope domain.Scope, proxyURL, userAgent string, sticky bool, buildHeaderTimeout time.Duration) (cachedClient, error) {
 	now := time.Now().UTC()
 	m.clientMu.Lock()
 	stale := m.cleanupClientCacheLocked(now)
@@ -898,7 +948,7 @@ func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope doma
 	m.clientMu.Unlock()
 	closeRequestClients(stale)
 
-	value, err := m.buildCachedClient(scope, proxyURL, userAgent)
+	value, err := m.buildCachedClient(scope, proxyURL, userAgent, buildHeaderTimeout)
 	if err != nil {
 		return cachedClient{}, err
 	}
@@ -932,13 +982,13 @@ func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope doma
 	return value, nil
 }
 
-func (m *Manager) buildCachedClient(scope domain.Scope, proxyURL, userAgent string) (cachedClient, error) {
+func (m *Manager) buildCachedClient(scope domain.Scope, proxyURL, userAgent string, buildHeaderTimeout time.Duration) (cachedClient, error) {
 	if scope == domain.ScopeBuild {
 		factory := m.newBuildClient
 		if factory == nil {
 			factory = newBuildRequestClient
 		}
-		client, err := factory(proxyURL)
+		client, err := factory(proxyURL, buildHeaderTimeout)
 		if err != nil {
 			return cachedClient{}, err
 		}
@@ -955,8 +1005,8 @@ func (m *Manager) buildCachedClient(scope domain.Scope, proxyURL, userAgent stri
 	return cachedClient{client: client, browser: client}, nil
 }
 
-func newBuildRequestClient(proxyURL string) (requestClient, error) {
-	return newBuildClient(proxyURL)
+func newBuildRequestClient(proxyURL string, responseHeaderTimeout time.Duration) (requestClient, error) {
+	return newBuildClient(proxyURL, responseHeaderTimeout)
 }
 
 func (m *Manager) cleanupClientCacheLocked(now time.Time) []requestClient {
@@ -1034,6 +1084,9 @@ func (m *Manager) Feedback(ctx context.Context, nodeID uint64, status int, trans
 }
 
 func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, nodeID uint64, status int, transportErr error) {
+	if scope == domain.ScopeBuild && neterrorpkg.IsResponseHeaderTimeout(transportErr) {
+		return
+	}
 	if nodeID == 0 {
 		if transportErr != nil || (scope != domain.ScopeBuild && status == http.StatusForbidden) {
 			m.clearanceMu.Lock()

@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -27,6 +28,7 @@ import (
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
@@ -47,6 +49,7 @@ const minimumTextBillingReservationTTL = 2 * time.Hour
 const billingReservationCrashGrace = 10 * time.Minute
 const mediaBillingReservationTTL = 24 * time.Hour
 const modelCatalogRefreshTimeout = 30 * time.Second
+const accountStateWriteTimeout = 3 * time.Second
 
 var freeQuotaUsagePattern = regexp.MustCompile(`(?i)tokens\s*\(actual/limit\)\s*:\s*([0-9]+)\s*/\s*([0-9]+)`)
 
@@ -124,34 +127,40 @@ type accountModelSyncer interface {
 
 // Service handles model routing, account selection, failover, and audit finalization.
 type Service struct {
-	models         routeResolver
-	audits         auditRecorder
-	accounts       *accountapp.Service
-	clientKeys     *clientkeyapp.Service
-	providers      *provider.Registry
-	selector       *Selector
-	consoleBreaker *consoleTeamCircuitBreaker
-	responses      repository.ResponseRepository
-	maxAttempts    atomic.Int64
-	requestTimeout atomic.Int64
-	mediaJobs      repository.MediaJobRepository
-	mediaAssets    videoAssetStore
-	mediaQueue     chan string
-	mediaMu        sync.Mutex
-	mediaQueued    map[string]struct{}
-	mediaWorker    int
-	mediaQueueFull atomic.Uint64
-	logger         *slog.Logger
-	rateLimitMu    sync.Mutex
-	rateLimits     map[string]teamModelRateLimit
-	rateLimitTeams map[uint64]string
-	modelSyncMu    sync.Mutex
-	modelSyncing   map[uint64]struct{}
+	models               routeResolver
+	audits               auditRecorder
+	accounts             *accountapp.Service
+	clientKeys           *clientkeyapp.Service
+	providers            *provider.Registry
+	selector             *Selector
+	consoleBreaker       *consoleTeamCircuitBreaker
+	responses            repository.ResponseRepository
+	maxAttempts          atomic.Int64
+	buildForbiddenReauth atomic.Pointer[buildForbiddenReauthPolicy]
+	requestTimeout       atomic.Int64
+	mediaJobs            repository.MediaJobRepository
+	mediaAssets          videoAssetStore
+	mediaQueue           chan string
+	mediaMu              sync.Mutex
+	mediaQueued          map[string]struct{}
+	mediaWorker          int
+	mediaQueueFull       atomic.Uint64
+	logger               *slog.Logger
+	rateLimitMu          sync.Mutex
+	rateLimits           map[string]teamModelRateLimit
+	rateLimitTeams       map[uint64]string
+	modelSyncMu          sync.Mutex
+	modelSyncing         map[uint64]struct{}
 }
 
 type teamModelRateLimit struct {
 	TeamFingerprint string
 	Until           time.Time
+}
+
+type buildForbiddenReauthPolicy struct {
+	enabled bool
+	codes   map[string]struct{}
 }
 
 func (s *Service) ConfigureMedia(repository repository.MediaJobRepository, concurrency int) {
@@ -178,6 +187,41 @@ func NewService(models routeResolver, audits auditRecorder, accounts *accountapp
 	}
 	service.UpdateMaxAttempts(maxAttempts)
 	return service
+}
+
+// UpdateBuildForbiddenReauthPolicy atomically replaces the Build account invalidation policy.
+func (s *Service) UpdateBuildForbiddenReauthPolicy(enabled bool, codes []string) {
+	policy := &buildForbiddenReauthPolicy{enabled: enabled, codes: make(map[string]struct{}, len(codes))}
+	for _, value := range codes {
+		code := strings.ToLower(strings.TrimSpace(value))
+		if code != "" {
+			policy.codes[code] = struct{}{}
+		}
+	}
+	s.buildForbiddenReauth.Store(policy)
+}
+
+func (s *Service) shouldInvalidateBuildForbidden(failure *UpstreamFailure) bool {
+	if failure == nil || failure.HTTPStatus != http.StatusForbidden {
+		return false
+	}
+	policy := s.buildForbiddenReauth.Load()
+	if policy == nil || !policy.enabled {
+		return false
+	}
+	_, matched := policy.codes[strings.ToLower(strings.TrimSpace(failure.UpstreamCode))]
+	return matched
+}
+
+func (s *Service) markReauthRequired(ctx context.Context, requestID string, credential accountdomain.Credential, reason string) bool {
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), accountStateWriteTimeout)
+	defer cancel()
+	if err := s.accounts.MarkReauthRequired(writeCtx, credential.ID, reason); err != nil {
+		s.logger.Error("account_reauth_required_write_failed", "request_id", requestID, "account_id", credential.ID, "provider", credential.Provider, "error", err)
+		return false
+	}
+	s.selector.MarkQuotaStateChanged(credential.Provider)
+	return true
 }
 
 func teamModelRateLimitKey(providerValue accountdomain.Provider, teamFingerprint, upstreamModel string) string {
@@ -590,9 +634,9 @@ attemptLoop:
 		var err error
 		selectionStarted := time.Now()
 		if ownership != nil {
-			lease, err = s.selector.AcquirePinned(ctx, route.Provider, ownership.AccountID, route.UpstreamModel, quotaMode, true)
+			lease, err = s.selector.AcquirePinned(ctx, route.Provider, ownership.AccountID, route.ID, route.UpstreamModel, quotaMode, true)
 		} else {
-			lease, err = s.selector.Acquire(ctx, route.Provider, route.UpstreamModel, quotaMode, affinityKey, excluded, !quotaProbeAttempted)
+			lease, err = s.selector.Acquire(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, affinityKey, excluded, !quotaProbeAttempted)
 		}
 		timing.markSelection(time.Since(selectionStarted))
 		if err != nil {
@@ -649,6 +693,9 @@ attemptLoop:
 				continue
 			}
 			lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
+			if !isRetryableTransportFailure(credential.Provider, err) {
+				break
+			}
 			failureFingerprints[lastFailure.Fingerprint]++
 			if failureFingerprints[lastFailure.Fingerprint] >= 2 {
 				break
@@ -693,6 +740,9 @@ attemptLoop:
 					break
 				} else {
 					lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
+					if !isRetryableTransportFailure(credential.Provider, err) {
+						break attemptLoop
+					}
 				}
 				continue
 			}
@@ -708,21 +758,46 @@ attemptLoop:
 		}
 		egressForbidden := s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden
 		finalEgressForbidden := egressForbidden && (attempt > 0 || attempt+1 >= attempts)
+		// Classify 403 bodies before egress retry. Definitive blocked-account signals invalidate and rotate the account;
+		// all other 403 responses retain the egress retry path without penalizing the account.
+		if response.StatusCode == http.StatusForbidden {
+			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
+			body, _ := readRetryableBody(response.Body)
+			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
+			if lastFailure.AccountBlocked {
+				failureHandled := s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s account is blocked", credential.Provider))
+				if lastFailure.AccountScoped && !failureHandled {
+					s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+				}
+				lease.Release()
+				lastErr = fmt.Errorf("上游返回 %d", response.StatusCode)
+				s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", lastFailure.AccountScoped, "account_blocked", true)
+				continue
+			}
+			if egressForbidden && !finalEgressForbidden {
+				// A non-blocking 403 is an egress/browser-session failure and must not penalize the account.
+				delete(excluded, credential.ID)
+				lease.Release()
+				lastErr = fmt.Errorf("上游出口会话被拒绝")
+				continue
+			}
+			// Restore the consumed final non-blocking 403 body for the common response path.
+			response.Body = io.NopCloser(bytes.NewReader(body))
+		}
 		if isRetryableResponse(response, route.Provider) && !finalEgressForbidden {
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			body, _ := readRetryableBody(response.Body)
-			if egressForbidden {
-				// Web 403/code 7 means the browser session at the egress was rejected; the Provider rebuilt it and reduced node health, so do not penalize the account.
-				delete(excluded, credential.ID)
-				lease.Release()
-				lastErr = fmt.Errorf("Grok Web 出口会话被反机器人规则拒绝")
-				lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
-				continue
-			}
 			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
+			buildForbiddenReauth := credential.Provider == accountdomain.ProviderBuild && s.shouldInvalidateBuildForbidden(lastFailure)
+			if buildForbiddenReauth {
+				lastFailure.AccountScoped = true
+			}
 			// The adapter only allows auto Super accounts to fall back to XAI within the same request;
 			// 403 from non-Super accounts triggers account-level cooldown and rotation.
 			freeBuildForbidden := response.StatusCode == http.StatusForbidden && credential.Provider == accountdomain.ProviderBuild && !accountdomain.IsBuildSuper(credential, lease.Billing)
+			if lastFailure.AccountBlocked || buildForbiddenReauth {
+				freeBuildForbidden = false
+			}
 			if freeBuildForbidden {
 				lastFailure.AccountScoped = true
 			}
@@ -753,7 +828,7 @@ attemptLoop:
 					break attemptLoop
 				}
 			}
-			if s.providers.SupportsCredentialRefresh(credential.Provider) && !authRecoveryAttempted[credential.ID] && credential.EncryptedRefreshToken != "" && (lastFailure.PermanentAccountDenial || lastFailure.CredentialRejected) {
+			if s.providers.SupportsCredentialRefresh(credential.Provider) && !authRecoveryAttempted[credential.ID] && credential.EncryptedRefreshToken != "" && !lastFailure.AccountBlocked && !buildForbiddenReauth && (lastFailure.PermanentAccountDenial || lastFailure.CredentialRejected) {
 				authRecoveryAttempted[credential.ID] = true
 				refreshed, refreshErr := ensureCredential(credential, true)
 				if refreshErr != nil {
@@ -772,6 +847,9 @@ attemptLoop:
 						break attemptLoop
 					}
 					lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
+					if !isRetryableTransportFailure(credential.Provider, err) {
+						break attemptLoop
+					}
 					continue attemptLoop
 				}
 				goto handleResponse
@@ -785,38 +863,35 @@ attemptLoop:
 				s.selector.MarkQuotaStateChanged(credential.Provider)
 				failureHandled = reconcileErr == nil && exhausted
 			} else if used, limit, exhausted := parseFreeQuotaExhaustion(body); exhausted {
-				s.selector.MarkFreeQuotaExhausted(ctx, credential, used, limit, quotaRecoveryHints{
-					Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
-				})
+				s.selector.MarkFreeQuotaExhausted(ctx, credential, used, limit)
 				failureHandled = true
 			} else if lastFailure.ModelQuotaExhausted {
-				s.selector.MarkModelQuotaExhausted(ctx, credential, route.UpstreamModel, retryAfter)
+				s.selector.MarkModelQuotaExhausted(ctx, credential, lease.Billing, route.UpstreamModel, retryAfter)
 				failureHandled = true
 			} else if lastFailure.FreeQuotaExhausted {
-				s.selector.MarkFreeQuotaExhausted(ctx, credential, 0, 0, quotaRecoveryHints{
-					Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
-				})
+				s.selector.MarkFreeQuotaExhausted(ctx, credential, 0, 0)
 				failureHandled = true
 			} else if lastFailure.QuotaExhausted {
 				s.selector.MarkPaymentQuotaExhausted(ctx, credential, quotaRecoveryHints{
-					Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
+					Billing: lease.Billing,
 				})
 				failureHandled = true
 			}
-			if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.PermanentAccountDenial {
+			if lastFailure.AccountBlocked {
+				failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s account is blocked", credential.Provider))
+			} else if buildForbiddenReauth {
+				failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s upstream error code %s matched the invalidation policy", credential.Provider, lastFailure.UpstreamCode))
+			} else if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.PermanentAccountDenial {
 				if credential.Provider == accountdomain.ProviderBuild {
 					// A Build account may lack permission for one chat model while its OAuth credential and video
 					// access remain valid. Isolate this denial to the model; reauthorization is needed only when the credential is rejected.
 					s.selector.MarkModelAccessDenied(ctx, credential, route.UpstreamModel, retryAfter)
+					failureHandled = true
 				} else {
-					_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s chat endpoint access denied", credential.Provider))
-					s.selector.MarkQuotaStateChanged(credential.Provider)
+					failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s chat endpoint access denied", credential.Provider))
 				}
-				failureHandled = true
 			} else if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.CredentialRejected {
-				_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s credential rejected", credential.Provider))
-				s.selector.MarkQuotaStateChanged(credential.Provider)
-				failureHandled = true
+				failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s credential rejected", credential.Provider))
 			}
 			if lastFailure.AccountScoped && !failureHandled {
 				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
@@ -834,6 +909,15 @@ attemptLoop:
 		}
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
 			s.selector.markSuccess(ctx, credential, lease.QuotaProbe)
+			if diagnostic := response.RecoveredPrimaryFailure; diagnostic != nil {
+				recoveredFailure := newHTTPUpstreamFailure(diagnostic.StatusCode, diagnostic.Body, credential.ID, credential.Name)
+				if recoveredFailure.AccountBlocked || (credential.Provider == accountdomain.ProviderBuild && s.shouldInvalidateBuildForbidden(recoveredFailure)) {
+					reason := fmt.Sprintf("%s primary endpoint denied account access", credential.Provider)
+					if !s.markReauthRequired(ctx, input.RequestID, credential, reason) {
+						s.selector.MarkModelAccessDenied(ctx, credential, route.UpstreamModel, 0)
+					}
+				}
+			}
 		}
 		accountID := credential.ID
 		var once sync.Once
@@ -1030,6 +1114,10 @@ func isUpstreamStreamFailure(errorCode string) bool {
 	}
 }
 
+func isRetryableTransportFailure(providerValue accountdomain.Provider, err error) bool {
+	return providerValue != accountdomain.ProviderBuild || !neterrorpkg.IsResponseHeaderTimeout(err)
+}
+
 func isSSOCredentialRejected(err error, credential accountdomain.Credential) bool {
 	if credential.AuthType != accountdomain.AuthTypeSSO || err == nil {
 		return false
@@ -1169,7 +1257,7 @@ func (s *Service) forwardOwnedResponse(ctx context.Context, input ResourceInput,
 		operation = "response_delete"
 	}
 	physicalCallCtx := infraegress.WithPhysicalCallTrace(ctx, string(ownership.Provider), operation)
-	lease, err := s.selector.AcquirePinned(ctx, ownership.Provider, ownership.AccountID, "", "", false)
+	lease, err := s.selector.AcquirePinned(ctx, ownership.Provider, ownership.AccountID, 0, "", "", false)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrResponseAccountUnavailable, err)
 	}
@@ -1299,10 +1387,10 @@ func isRetryableResponse(response *provider.Response, upstreamProvider accountdo
 	return !strings.EqualFold(strings.TrimSpace(response.Header.Get("X-Should-Retry")), "false")
 }
 
-// forcesAccountFailover scopes the Build billing-wall override to the Provider
-// whose 402 contract is known. Other Providers continue honoring X-Should-Retry.
+// forcesAccountFailover keeps Build account-scoped billing and permission failures on the
+// account-rotation path so their state can be recorded before another account is selected.
 func forcesAccountFailover(status int, upstreamProvider accountdomain.Provider) bool {
-	return upstreamProvider == accountdomain.ProviderBuild && status == http.StatusPaymentRequired
+	return upstreamProvider == accountdomain.ProviderBuild && (status == http.StatusPaymentRequired || status == http.StatusForbidden)
 }
 
 func parseRetryAfter(value string, now time.Time) time.Duration {

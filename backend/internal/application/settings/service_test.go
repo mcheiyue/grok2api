@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -46,6 +47,7 @@ func TestUpdatePersistsAppliesAndReportsRestart(t *testing.T) {
 	service := NewService(cfg, time.Time{}, 0, repository, nil, func(next config.Config) { applied = next })
 	input := service.Get().Config
 	input.Server.MaxConcurrentRequests = 2048
+	input.ProviderBuild.ResponseHeaderTimeout = "7m"
 	input.Routing.MaxAttempts = 5
 	input.Routing.PreferFreeBuild = true
 	input.Routing.SegmentedSelector = SegmentedSelectorConfig{Enabled: true, MinCandidates: 5000, WindowSize: 96}
@@ -68,6 +70,9 @@ func TestUpdatePersistsAppliesAndReportsRestart(t *testing.T) {
 	if applied.Server.MaxConcurrentRequests != 2048 {
 		t.Fatalf("server configuration was not applied: %#v", applied.Server)
 	}
+	if applied.Provider.Build.ResponseHeaderTimeout.Value() != 7*time.Minute {
+		t.Fatalf("Build response header timeout was not applied: %s", applied.Provider.Build.ResponseHeaderTimeout.Value())
+	}
 	if applied.Media.MaxTotalBytes != 2<<30 || applied.Media.CleanupThresholdPercent != 75 || applied.Media.CleanupInterval.Value() != 5*time.Minute {
 		t.Fatalf("media configuration was not applied: %#v", applied.Media)
 	}
@@ -87,8 +92,26 @@ func TestUpdatePersistsAppliesAndReportsRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reloaded.Server.MaxConcurrentRequests != 2048 || reloaded.Routing.MaxAttempts != 5 || !reloaded.Routing.PreferFreeBuild || !reloaded.Routing.SegmentedSelectorEnabled || reloaded.Routing.SegmentedMinCandidates != 5000 || reloaded.Routing.SegmentedWindowSize != 96 || reloaded.Audit.BufferSize != input.Audit.BufferSize || reloaded.Media.MaxTotalBytes != 2<<30 || reloaded.Media.CleanupThresholdPercent != 75 || reloaded.Batch.SyncConcurrency != 28 || reloaded.Batch.RandomDelay.Value() != 750*time.Millisecond || reloaded.Provider.Console.BaseURL != "https://console.example.com" {
+	if reloaded.Server.MaxConcurrentRequests != 2048 || reloaded.Provider.Build.ResponseHeaderTimeout.Value() != 7*time.Minute || reloaded.Routing.MaxAttempts != 5 || !reloaded.Routing.PreferFreeBuild || !reloaded.Routing.SegmentedSelectorEnabled || reloaded.Routing.SegmentedMinCandidates != 5000 || reloaded.Routing.SegmentedWindowSize != 96 || reloaded.Audit.BufferSize != input.Audit.BufferSize || reloaded.Media.MaxTotalBytes != 2<<30 || reloaded.Media.CleanupThresholdPercent != 75 || reloaded.Batch.SyncConcurrency != 28 || reloaded.Batch.RandomDelay.Value() != 750*time.Millisecond || reloaded.Provider.Console.BaseURL != "https://console.example.com" {
 		t.Fatalf("configuration was not persisted")
+	}
+}
+
+func TestUpdateRejectsBuildResponseHeaderTimeoutOutsideSafeRange(t *testing.T) {
+	for _, value := range []string{"29s", "31m"} {
+		t.Run(value, func(t *testing.T) {
+			cfg := testConfig(t)
+			repository := &runtimeSettingsRepositoryStub{}
+			service := NewService(cfg, time.Time{}, 0, repository, nil, nil)
+			input := service.Get().Config
+			input.ProviderBuild.ResponseHeaderTimeout = value
+			if _, err := service.Update(context.Background(), 0, input); !errors.Is(err, ErrInvalidInput) {
+				t.Fatalf("error = %v", err)
+			}
+			if repository.found {
+				t.Fatal("invalid Build response header timeout was persisted")
+			}
+		})
 	}
 }
 
@@ -498,6 +521,8 @@ func TestUpdateAccountsAutoCleanRoundTrip(t *testing.T) {
 	service := NewService(cfg, time.Time{}, 0, repo, nil, func(next config.Config) { applied = next })
 	input := service.Get().Config
 	input.Accounts = AccountsConfig{
+		MarkBuildForbiddenReauth: true, MarkBuildForbiddenReauthProvided: true,
+		BuildForbiddenReauthCodes: []string{" Permission-Denied ", "permission-denied", "team-access-denied"}, BuildForbiddenReauthCodesProvided: true,
 		AutoCleanReauthEnabled: true, AutoCleanReauthInterval: "5m",
 		AutoCleanReauthMinAge: "2h", AutoCleanIncludeDisabled: true,
 	}
@@ -505,13 +530,16 @@ func TestUpdateAccountsAutoCleanRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !applied.Accounts.AutoCleanReauthEnabled || !applied.Accounts.AutoCleanIncludeDisabled {
+	if !applied.Accounts.MarkBuildForbiddenReauth || !applied.Accounts.AutoCleanReauthEnabled || !applied.Accounts.AutoCleanIncludeDisabled {
 		t.Fatalf("applied accounts = %#v", applied.Accounts)
+	}
+	if len(applied.Accounts.BuildForbiddenReauthCodes) != 2 || applied.Accounts.BuildForbiddenReauthCodes[0] != "permission-denied" || applied.Accounts.BuildForbiddenReauthCodes[1] != "team-access-denied" {
+		t.Fatalf("normalized Build forbidden codes = %#v", applied.Accounts.BuildForbiddenReauthCodes)
 	}
 	if applied.Accounts.AutoCleanReauthInterval.Value() != 5*time.Minute || applied.Accounts.AutoCleanReauthMinAge.Value() != 2*time.Hour {
 		t.Fatalf("applied accounts durations = %#v", applied.Accounts)
 	}
-	if !snapshot.Config.Accounts.AutoCleanReauthEnabled || snapshot.Config.Accounts.AutoCleanReauthInterval != "5m" {
+	if !snapshot.Config.Accounts.MarkBuildForbiddenReauth || !snapshot.Config.Accounts.AutoCleanReauthEnabled || snapshot.Config.Accounts.AutoCleanReauthInterval != "5m" {
 		t.Fatalf("snapshot accounts = %#v", snapshot.Config.Accounts)
 	}
 }
@@ -519,6 +547,8 @@ func TestUpdateAccountsAutoCleanRoundTrip(t *testing.T) {
 func TestUpdateWithoutAccountsPreservesCurrentAutoCleanConfig(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Accounts.AutoCleanReauthEnabled = true
+	cfg.Accounts.MarkBuildForbiddenReauth = true
+	cfg.Accounts.BuildForbiddenReauthCodes = []string{"custom-denial"}
 	cfg.Accounts.AutoCleanReauthInterval = config.Duration(7 * time.Minute)
 	cfg.Accounts.AutoCleanReauthMinAge = config.Duration(3 * time.Hour)
 	cfg.Accounts.AutoCleanIncludeDisabled = true
@@ -532,7 +562,64 @@ func TestUpdateWithoutAccountsPreservesCurrentAutoCleanConfig(t *testing.T) {
 	if _, err := service.Update(context.Background(), 0, input); err != nil {
 		t.Fatal(err)
 	}
-	if !applied.Accounts.AutoCleanReauthEnabled || !applied.Accounts.AutoCleanIncludeDisabled || applied.Accounts.AutoCleanReauthInterval.Value() != 7*time.Minute || applied.Accounts.AutoCleanReauthMinAge.Value() != 3*time.Hour {
+	if !applied.Accounts.MarkBuildForbiddenReauth || !applied.Accounts.AutoCleanReauthEnabled || !applied.Accounts.AutoCleanIncludeDisabled || applied.Accounts.AutoCleanReauthInterval.Value() != 7*time.Minute || applied.Accounts.AutoCleanReauthMinAge.Value() != 3*time.Hour {
 		t.Fatalf("accounts changed by legacy update: %#v", applied.Accounts)
+	}
+}
+
+func TestUpdateWithoutBuildForbiddenFieldPreservesCurrentPolicy(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Accounts.MarkBuildForbiddenReauth = true
+	cfg.Accounts.BuildForbiddenReauthCodes = []string{"custom-denial"}
+	var applied config.Config
+	service := NewService(cfg, time.Time{}, 0, &runtimeSettingsRepositoryStub{}, nil, func(next config.Config) { applied = next })
+	input := service.Get().Config
+	input.Accounts.MarkBuildForbiddenReauth = false
+	input.Accounts.MarkBuildForbiddenReauthProvided = false
+	input.Accounts.BuildForbiddenReauthCodes = nil
+	input.Accounts.BuildForbiddenReauthCodesProvided = false
+	input.Server.MaxConcurrentRequests++
+	if _, err := service.Update(context.Background(), 0, input); err != nil {
+		t.Fatal(err)
+	}
+	if !applied.Accounts.MarkBuildForbiddenReauth || len(applied.Accounts.BuildForbiddenReauthCodes) != 1 || applied.Accounts.BuildForbiddenReauthCodes[0] != "custom-denial" {
+		t.Fatalf("legacy update changed the Build forbidden-account policy: %#v", applied.Accounts)
+	}
+}
+
+func TestLoadPersistedKeepsDefaultBuildForbiddenCodesForOlderPayload(t *testing.T) {
+	cfg := testConfig(t)
+	value := toDomainConfig(cfg)
+	value.Accounts.BuildForbiddenReauthCodes = nil
+	repository := &runtimeSettingsRepositoryStub{value: value, found: true}
+	loaded, _, _, err := LoadPersisted(context.Background(), cfg, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Accounts.BuildForbiddenReauthCodes) != 1 || loaded.Accounts.BuildForbiddenReauthCodes[0] != "permission-denied" {
+		t.Fatalf("Build forbidden code defaults were not preserved: %#v", loaded.Accounts.BuildForbiddenReauthCodes)
+	}
+}
+
+func TestUpdateRejectsInvalidBuildForbiddenCodes(t *testing.T) {
+	for _, codes := range [][]string{{}, {"contains spaces"}, func() []string {
+		values := make([]string, 33)
+		for index := range values {
+			values[index] = fmt.Sprintf("denial-%d", index)
+		}
+		return values
+	}()} {
+		cfg := testConfig(t)
+		repository := &runtimeSettingsRepositoryStub{}
+		service := NewService(cfg, time.Time{}, 0, repository, nil, nil)
+		input := service.Get().Config
+		input.Accounts.BuildForbiddenReauthCodes = codes
+		input.Accounts.BuildForbiddenReauthCodesProvided = true
+		if _, err := service.Update(context.Background(), 0, input); !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("codes %#v: error = %v", codes, err)
+		}
+		if repository.found {
+			t.Fatalf("invalid codes were persisted: %#v", codes)
+		}
 	}
 }

@@ -57,6 +57,9 @@ bootstrapAdmin:
 	if cfg.Accounts.AutoCleanReauthEnabled || cfg.Accounts.AutoCleanIncludeDisabled {
 		t.Fatal("accounts auto-clean flags should default to false")
 	}
+	if cfg.Accounts.MarkBuildForbiddenReauth || len(cfg.Accounts.BuildForbiddenReauthCodes) != 1 || cfg.Accounts.BuildForbiddenReauthCodes[0] != "permission-denied" {
+		t.Fatalf("Build forbidden-account defaults = %#v", cfg.Accounts)
+	}
 	if cfg.Accounts.AutoCleanReauthInterval.Value() != 10*time.Minute || cfg.Accounts.AutoCleanReauthMinAge.Value() != time.Hour {
 		t.Fatalf("accounts auto-clean defaults = %#v", cfg.Accounts)
 	}
@@ -68,6 +71,9 @@ bootstrapAdmin:
 	}
 	if cfg.Audit.LedgerMode != "enforce" || cfg.Audit.LedgerFailureThreshold != 1 {
 		t.Fatalf("audit ledger defaults = %#v", cfg.Audit)
+	}
+	if cfg.Provider.Build.ResponseHeaderTimeout.Value() != 5*time.Minute {
+		t.Fatalf("Build response header timeout = %s", cfg.Provider.Build.ResponseHeaderTimeout.Value())
 	}
 	expectedDatabasePath := filepath.Join(dir, "data", "backend.db")
 	if cfg.Database.SQLite.Path != expectedDatabasePath {
@@ -83,15 +89,25 @@ bootstrapAdmin:
 	}
 }
 
+func TestBuildResponseHeaderTimeoutIsRuntimeOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("provider:\n  build:\n    responseHeaderTimeout: 10m\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("runtime-only Build response header timeout was accepted from YAML")
+	}
+}
+
 func TestDefaultGrokBuildClientVersionMatchesLocalBaseline(t *testing.T) {
 	build := defaultConfig().Provider.Build
-	if RecommendedBuildClientVersion != "0.2.106" {
+	if RecommendedBuildClientVersion != "0.2.111" {
 		t.Fatalf("recommended clientVersion = %q", RecommendedBuildClientVersion)
 	}
 	if build.ClientVersion != RecommendedBuildClientVersion {
 		t.Fatalf("clientVersion = %q", build.ClientVersion)
 	}
-	if RecommendedBuildUserAgent != "grok-shell/0.2.106 (linux; x86_64)" {
+	if RecommendedBuildUserAgent != "grok-shell/0.2.111 (linux; x86_64)" {
 		t.Fatalf("recommended userAgent = %q", RecommendedBuildUserAgent)
 	}
 	if build.UserAgent != RecommendedBuildUserAgent {
