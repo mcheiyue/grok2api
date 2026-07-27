@@ -17,7 +17,7 @@ services:
     security_opt:
       - no-new-privileges:true
 
-  # 可选防封边车（profile）。管理端出口节点可填 socks5h://warp:1080。
+# 可选防封边车（profile）。管理端出口节点可填 socks5h://warp:1080。
   # 启动：docker compose --profile warp --profile flaresolverr up -d
   # 亦可叠加历史 overlay：docker compose -f docker-compose.yml -f docker-compose.warp.yml up -d
   # Clearance 模式选 FlareSolverr 时用 http://flaresolverr:8191（上游托管 clearance）。
