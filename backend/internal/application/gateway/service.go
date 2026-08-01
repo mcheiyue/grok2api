@@ -1099,6 +1099,45 @@ attemptLoop:
 			continue
 		}
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
+			// Option A: after 2xx headers, wait for the first stream byte before
+			// handing the body to the client. If the SSE dies empty (classic
+			// 200warn / upstream_stream_interrupted with 0 tokens), nothing has
+			// been written downstream yet — safe to rotate account and retry.
+			if input.Streaming {
+				primed, primeErr := primeStreamingBody(response.Body, streamPrimeTimeout)
+				if primeErr != nil {
+					lastFailure = &UpstreamFailure{
+						HTTPStatus:    http.StatusBadGateway,
+						Code:          "upstream_stream_interrupted",
+						PublicMessage: "上游流在首包前中断",
+						AccountID:     credential.ID,
+						AccountName:   credential.Name,
+						Cause:         primeErr,
+						Fingerprint:   "stream_prime_failed",
+					}
+					lastErr = primeErr
+					s.logger.Warn("upstream_stream_prime_failed",
+						"request_id", input.RequestID,
+						"account_id", credential.ID,
+						"provider", credential.Provider,
+						"error", primeErr,
+					)
+					if markErr := s.selector.MarkFailureAfterSuccess(ctx, credential, http.StatusBadGateway, 0); markErr != nil {
+						s.logger.Warn("stream_prime_health_write_failed", "account_id", credential.ID, "provider", credential.Provider, "error", markErr)
+					}
+					lease.Release()
+					if ownership != nil {
+						// Pinned Responses stay on one account; do not spin.
+						break attemptLoop
+					}
+					failureFingerprints[lastFailure.Fingerprint]++
+					if failureFingerprints[lastFailure.Fingerprint] >= 2 {
+						break attemptLoop
+					}
+					continue attemptLoop
+				}
+				response.Body = primed
+			}
 			s.selector.markSuccess(ctx, credential, lease.QuotaProbe)
 			if diagnostic := response.RecoveredPrimaryFailure; diagnostic != nil {
 				recoveredFailure := newHTTPUpstreamFailure(diagnostic.StatusCode, diagnostic.Body, credential.ID, credential.Name)
