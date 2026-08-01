@@ -117,8 +117,19 @@ func primeStreamingBody(body io.ReadCloser, timeout time.Duration) (io.ReadClose
 				closer: body,
 			}, nil
 		}
-		_ = body.Close()
 		primeBytes := len(res.data)
+		// If the upstream sent significant data without valid SSE events, the
+		// response is likely non-SSE (e.g. a large JSON blob). Pass it through
+		// rather than failing and retrying. 4 KiB is a safe threshold: real
+		// responses will exceed it, keepalive/comment noise will not.
+		if primeBytes >= 4096 {
+			_ = body.Close()
+			return &primedBody{
+				reader: bytes.NewReader(res.data),
+				closer: io.NopCloser(nil),
+			}, nil
+		}
+		_ = body.Close()
 		if primeBytes == 0 {
 			if res.err == nil || errors.Is(res.err, io.EOF) {
 				return nil, &streamPrimeError{Bytes: 0, Err: errStreamPrimeEmpty}
