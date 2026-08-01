@@ -8,12 +8,38 @@ import (
 	"time"
 )
 
-// streamPrimeTimeout is how long we wait for the first upstream stream byte
+// streamPrimeTimeout is how long we wait for the first *valid SSE data event*
 // after a 2xx response. Slow first-token (reasoning) can exceed 30s; keep
 // aligned with typical client timeouts without waiting forever.
 const streamPrimeTimeout = 90 * time.Second
 
-var errStreamPrimeEmpty = errors.New("upstream stream ended before first byte")
+// maxPrimeHeadBytes caps how much we buffer while hunting for a valid event.
+const maxPrimeHeadBytes = 64 << 10
+
+var (
+	errStreamPrimeEmpty   = errors.New("upstream stream ended before first byte")
+	errStreamPrimeNoEvent = errors.New("upstream stream ended before first valid SSE data event")
+)
+
+// streamPrimeError carries how many head bytes were seen before prime failed.
+type streamPrimeError struct {
+	Bytes int
+	Err   error
+}
+
+func (e *streamPrimeError) Error() string {
+	if e == nil || e.Err == nil {
+		return "upstream stream prime failed"
+	}
+	return fmt.Sprintf("%v (prime_bytes=%d)", e.Err, e.Bytes)
+}
+
+func (e *streamPrimeError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
 
 // primedBody replays the prefetched head, then continues reading from source.
 type primedBody struct {
@@ -32,17 +58,16 @@ func (p *primedBody) Close() error {
 	return p.closer.Close()
 }
 
-// primeStreamingBody blocks until the upstream body yields at least one byte
-// (or fails/times out). On success the returned ReadCloser replays those bytes
-// so the caller can hand the body to the client unchanged. On failure the
-// original body is closed.
+// primeStreamingBody blocks until the upstream body yields at least one
+// complete SSE event with a non-empty JSON `data:` payload (or fails/times out).
+// Keepalive comments (`: ...`) and bare whitespace do NOT count — that is the
+// fix for 200warn cases where "any 1 byte" released the body too early.
 //
-// This is the Option-A preflight for 200warn / upstream_stream_interrupted:
-// HTTP 2xx headers arrived but the SSE body died before any payload — retry
-// is still safe because nothing was written to the client yet.
+// On success the returned ReadCloser replays the buffered head so the caller
+// can hand the body to the client unchanged. On failure the original body is closed.
 func primeStreamingBody(body io.ReadCloser, timeout time.Duration) (io.ReadCloser, error) {
 	if body == nil {
-		return nil, errStreamPrimeEmpty
+		return nil, &streamPrimeError{Err: errStreamPrimeEmpty}
 	}
 	if timeout <= 0 {
 		timeout = streamPrimeTimeout
@@ -54,13 +79,30 @@ func primeStreamingBody(body io.ReadCloser, timeout time.Duration) (io.ReadClose
 	}
 	ch := make(chan readResult, 1)
 	go func() {
+		var head bytes.Buffer
 		buf := make([]byte, 8192)
-		n, err := body.Read(buf)
-		var data []byte
-		if n > 0 {
-			data = append([]byte(nil), buf[:n]...)
+		for {
+			n, err := body.Read(buf)
+			if n > 0 {
+				// Avoid unbounded growth if the peer never sends a valid event.
+				if head.Len()+n > maxPrimeHeadBytes {
+					ch <- readResult{
+						data: head.Bytes(),
+						err:  fmt.Errorf("upstream stream prime head exceeded %d bytes without valid SSE event", maxPrimeHeadBytes),
+					}
+					return
+				}
+				_, _ = head.Write(buf[:n])
+				if hasValidSSEDataEvent(head.Bytes()) {
+					ch <- readResult{data: append([]byte(nil), head.Bytes()...), err: nil}
+					return
+				}
+			}
+			if err != nil {
+				ch <- readResult{data: append([]byte(nil), head.Bytes()...), err: err}
+				return
+			}
 		}
-		ch <- readResult{data: data, err: err}
 	}()
 
 	timer := time.NewTimer(timeout)
@@ -68,22 +110,86 @@ func primeStreamingBody(body io.ReadCloser, timeout time.Duration) (io.ReadClose
 
 	select {
 	case res := <-ch:
-		if len(res.data) == 0 {
-			_ = body.Close()
-			if res.err == nil || errors.Is(res.err, io.EOF) {
-				return nil, errStreamPrimeEmpty
-			}
-			return nil, res.err
+		if hasValidSSEDataEvent(res.data) && (res.err == nil || errors.Is(res.err, io.EOF)) {
+			// Valid event in head; keep body open for the remainder (may already be EOF).
+			return &primedBody{
+				reader: io.MultiReader(bytes.NewReader(res.data), body),
+				closer: body,
+			}, nil
 		}
-		// Prefetched head + remainder (source may already be at EOF).
-		return &primedBody{
-			reader: io.MultiReader(bytes.NewReader(res.data), body),
-			closer: body,
-		}, nil
+		_ = body.Close()
+		primeBytes := len(res.data)
+		if primeBytes == 0 {
+			if res.err == nil || errors.Is(res.err, io.EOF) {
+				return nil, &streamPrimeError{Bytes: 0, Err: errStreamPrimeEmpty}
+			}
+			return nil, &streamPrimeError{Bytes: 0, Err: res.err}
+		}
+		if res.err == nil || errors.Is(res.err, io.EOF) {
+			return nil, &streamPrimeError{Bytes: primeBytes, Err: errStreamPrimeNoEvent}
+		}
+		return nil, &streamPrimeError{Bytes: primeBytes, Err: res.err}
 	case <-timer.C:
 		_ = body.Close()
 		// Allow the blocked Read to unblock after Close without leaking the goroutine.
 		go func() { <-ch }()
-		return nil, fmt.Errorf("upstream stream prime timeout after %s", timeout)
+		return nil, &streamPrimeError{
+			Bytes: 0,
+			Err:   fmt.Errorf("upstream stream prime timeout after %s", timeout),
+		}
 	}
+}
+
+// hasValidSSEDataEvent reports whether data contains at least one complete SSE
+// event (terminated by a blank line) with a non-empty JSON `data:` payload.
+// Keepalive comments and empty data lines do not qualify.
+func hasValidSSEDataEvent(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	// Walk complete events ending at \n\n (accept \r\n\r\n too via normalize).
+	normalized := bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
+	start := 0
+	for start < len(normalized) {
+		rel := bytes.Index(normalized[start:], []byte("\n\n"))
+		if rel < 0 {
+			return false
+		}
+		event := normalized[start : start+rel]
+		start += rel + 2
+		if sseEventHasJSONData(event) {
+			return true
+		}
+	}
+	return false
+}
+
+func sseEventHasJSONData(event []byte) bool {
+	for _, rawLine := range bytes.Split(event, []byte("\n")) {
+		line := bytes.TrimSpace(rawLine)
+		if len(line) == 0 || line[0] == ':' {
+			continue // empty or comment
+		}
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+		// Real upstream events are JSON objects/arrays.
+		if payload[0] == '{' || payload[0] == '[' {
+			return true
+		}
+	}
+	return false
+}
+
+// primeBytesOf extracts buffered head size from a prime error (0 if unknown).
+func primeBytesOf(err error) int {
+	var pe *streamPrimeError
+	if errors.As(err, &pe) && pe != nil {
+		return pe.Bytes
+	}
+	return 0
 }

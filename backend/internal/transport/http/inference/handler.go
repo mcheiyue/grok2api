@@ -1064,7 +1064,10 @@ func copyStream(writer gin.ResponseWriter, source io.Reader, protocol streamProt
 			if inspector.terminalSuccess {
 				return inspector.Metadata(), nil
 			}
-			return inspector.Metadata(), fmt.Errorf("%w: %v", errUpstreamStreamRead, readErr)
+			// Thin diagnostics for 200warn / upstream_stream_interrupted:
+			// bytes already forwarded, whether first token was seen, raw read error.
+			return inspector.Metadata(), fmt.Errorf("%w: bytes_forwarded=%d had_first_token=%v read_err=%v",
+				errUpstreamStreamRead, transferred, inspector.firstTokenSeen, readErr)
 		}
 	}
 }

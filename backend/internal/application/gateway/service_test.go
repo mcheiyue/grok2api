@@ -3266,6 +3266,10 @@ func (a *failoverAdapter) ForwardResponse(_ context.Context, request provider.Re
 		}
 		header = a.failureHeader.Clone()
 	}
+	// Streaming successes must look like real SSE so stream prime (valid data event) passes.
+	if status >= 200 && status < 300 && request.Streaming && body == "ok" {
+		body = "data: {\"type\":\"response.created\",\"id\":\"resp-test\"}\n\n"
+	}
 	return &provider.Response{StatusCode: status, Header: header, Body: io.NopCloser(strings.NewReader(body))}, nil
 }
 

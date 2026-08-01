@@ -1104,12 +1104,15 @@ attemptLoop:
 			// 200warn / upstream_stream_interrupted with 0 tokens), nothing has
 			// been written downstream yet — safe to rotate account and retry.
 			if input.Streaming {
+				// Wait for a complete SSE data event (JSON), not merely any byte —
+				// keepalive/comment bytes previously caused false prime success
+				// and left classic 200warn (0 tokens, attempt=0) to the client.
 				primed, primeErr := primeStreamingBody(response.Body, streamPrimeTimeout)
 				if primeErr != nil {
 					lastFailure = &UpstreamFailure{
 						HTTPStatus:    http.StatusBadGateway,
 						Code:          "upstream_stream_interrupted",
-						PublicMessage: "上游流在首包前中断",
+						PublicMessage: "上游流在有效首事件前中断",
 						AccountID:     credential.ID,
 						AccountName:   credential.Name,
 						Cause:         primeErr,
@@ -1120,6 +1123,7 @@ attemptLoop:
 						"request_id", input.RequestID,
 						"account_id", credential.ID,
 						"provider", credential.Provider,
+						"prime_bytes", primeBytesOf(primeErr),
 						"error", primeErr,
 					)
 					if markErr := s.selector.MarkFailureAfterSuccess(ctx, credential, http.StatusBadGateway, 0); markErr != nil {

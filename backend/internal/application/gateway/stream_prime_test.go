@@ -17,6 +17,7 @@ type stallReader struct {
 func (s *stallReader) Read(p []byte) (int, error) {
 	if s.delay > 0 {
 		time.Sleep(s.delay)
+		s.delay = 0
 	}
 	if s.data == "" {
 		if s.err != nil {
@@ -37,9 +38,9 @@ func (s *stallReader) Read(p []byte) (int, error) {
 
 func (s *stallReader) Close() error { return nil }
 
-func TestPrimeStreamingBodyReplaysHead(t *testing.T) {
+func TestPrimeStreamingBodyReplaysValidSSE(t *testing.T) {
 	t.Parallel()
-	src := io.NopCloser(strings.NewReader("data: hello\n\nrest"))
+	src := io.NopCloser(strings.NewReader("data: {\"type\":\"response.created\"}\n\nrest"))
 	primed, err := primeStreamingBody(src, time.Second)
 	if err != nil {
 		t.Fatalf("prime: %v", err)
@@ -49,8 +50,35 @@ func TestPrimeStreamingBodyReplaysHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read all: %v", err)
 	}
-	if got := string(all); got != "data: hello\n\nrest" {
+	if got := string(all); got != "data: {\"type\":\"response.created\"}\n\nrest" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestPrimeStreamingBodyRejectsKeepaliveOnly(t *testing.T) {
+	t.Parallel()
+	// Classic false prime: comment/keepalive bytes then EOF — must NOT succeed.
+	src := io.NopCloser(strings.NewReader(": keep-alive\n\n"))
+	_, err := primeStreamingBody(src, time.Second)
+	if !errors.Is(err, errStreamPrimeNoEvent) {
+		t.Fatalf("want errStreamPrimeNoEvent, got %v", err)
+	}
+	if primeBytesOf(err) == 0 {
+		t.Fatalf("expected prime_bytes > 0, err=%v", err)
+	}
+}
+
+func TestPrimeStreamingBodyWaitsPastKeepaliveForJSON(t *testing.T) {
+	t.Parallel()
+	src := io.NopCloser(strings.NewReader(": ping\n\ndata: {\"type\":\"response.created\"}\n\nmore"))
+	primed, err := primeStreamingBody(src, time.Second)
+	if err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+	defer primed.Close()
+	all, _ := io.ReadAll(primed)
+	if !strings.Contains(string(all), `"response.created"`) || !strings.HasSuffix(string(all), "more") {
+		t.Fatalf("got %q", all)
 	}
 }
 
@@ -65,7 +93,7 @@ func TestPrimeStreamingBodyEmptyEOF(t *testing.T) {
 
 func TestPrimeStreamingBodyTimeout(t *testing.T) {
 	t.Parallel()
-	src := &stallReader{delay: 200 * time.Millisecond, data: "late"}
+	src := &stallReader{delay: 200 * time.Millisecond, data: "data: {\"type\":\"response.created\"}\n\n"}
 	_, err := primeStreamingBody(src, 20*time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "prime timeout") {
 		t.Fatalf("want prime timeout, got %v", err)
@@ -79,5 +107,27 @@ func TestPrimeStreamingBodyReadError(t *testing.T) {
 	_, err := primeStreamingBody(src, time.Second)
 	if !errors.Is(err, boom) {
 		t.Fatalf("want boom, got %v", err)
+	}
+}
+
+func TestHasValidSSEDataEvent(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"", false},
+		{": ping\n\n", false},
+		{"data: \n\n", false},
+		{"data: [DONE]\n\n", false},
+		{"data: {\"type\":\"response.created\"}\n\n", true},
+		{": ping\n\ndata: {\"a\":1}\n\n", true},
+		{"data: {\"type\":\"response.created\"}\n", false}, // incomplete event
+		{"event: message\ndata: {\"x\":1}\n\n", true},
+	}
+	for _, tc := range cases {
+		if got := hasValidSSEDataEvent([]byte(tc.in)); got != tc.want {
+			t.Fatalf("in=%q got=%v want=%v", tc.in, got, tc.want)
+		}
 	}
 }
