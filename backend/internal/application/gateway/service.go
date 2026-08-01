@@ -1103,7 +1103,7 @@ attemptLoop:
 			// handing the body to the client. If the SSE dies empty (classic
 			// 200warn / upstream_stream_interrupted with 0 tokens), nothing has
 			// been written downstream yet — safe to rotate account and retry.
-			if input.Streaming {
+			if input.Streaming && isSSEContentType(response.Header) {
 				// Wait for a complete SSE data event (JSON), not merely any byte —
 				// keepalive/comment bytes previously caused false prime success
 				// and left classic 200warn (0 tokens, attempt=0) to the client.
@@ -1142,6 +1142,8 @@ attemptLoop:
 				}
 				response.Body = primed
 			}
+			// Non-SSE responses (e.g. application/json) are passed through
+			// without priming — the entire body is consumed at once by the client.
 			s.selector.markSuccess(ctx, credential, lease.QuotaProbe)
 			if diagnostic := response.RecoveredPrimaryFailure; diagnostic != nil {
 				recoveredFailure := newHTTPUpstreamFailure(diagnostic.StatusCode, diagnostic.Body, credential.ID, credential.Name)
@@ -1705,4 +1707,15 @@ func firstError(values ...error) error {
 		}
 	}
 	return errors.New("未知上游错误")
+}
+
+// isSSEContentType returns true when the upstream response indicates it is a
+// Server-Sent Events stream. Non-SSE responses (plain JSON, etc.) skip the
+// stream prime because the entire body is consumed at once by the client.
+func isSSEContentType(header http.Header) bool {
+	if header == nil {
+		return false
+	}
+	ct := header.Get("Content-Type")
+	return strings.Contains(ct, "text/event-stream") || strings.Contains(ct, "application/x-ndjson")
 }
