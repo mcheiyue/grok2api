@@ -124,11 +124,10 @@ func primeStreamingBody(body io.ReadCloser, timeout time.Duration) (io.ReadClose
 			}, false, nil
 		}
 		primeBytes := len(res.data)
-		// If the upstream sent significant data without valid SSE events, hand it
-		// to the protocol layer for validation instead of retrying blindly. 4 KiB
-		// is a safe threshold: real responses will exceed it, keepalive/comment
-		// noise will not.
-		if primeBytes >= 4096 {
+		// Large bodies without an SSE frame are likely mislabelled JSON. A body
+		// that already contains SSE metadata must stay on the retry path instead
+		// of being handed to the JSON converter.
+		if primeBytes >= 4096 && !hasSSEFrame(res.data) {
 			_ = body.Close()
 			return &primedBody{
 				reader: bytes.NewReader(res.data),
@@ -176,6 +175,26 @@ func hasValidSSEDataEvent(data []byte) bool {
 		start += rel + 2
 		if sseEventHasGeneratedPayload(event) {
 			return true
+		}
+	}
+	return false
+}
+
+func hasSSEFrame(data []byte) bool {
+	normalized := bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
+	start := 0
+	for start < len(normalized) {
+		rel := bytes.Index(normalized[start:], []byte("\n\n"))
+		if rel < 0 {
+			return false
+		}
+		event := normalized[start : start+rel]
+		start += rel + 2
+		for _, rawLine := range bytes.Split(event, []byte("\n")) {
+			line := bytes.TrimSpace(rawLine)
+			if bytes.HasPrefix(line, []byte("data:")) || bytes.HasPrefix(line, []byte("event:")) {
+				return true
+			}
 		}
 	}
 	return false

@@ -97,6 +97,24 @@ func TestPrimeStreamingBodyRejectsMetadataBeforePayload(t *testing.T) {
 	}
 }
 
+func TestPrimeStreamingBodyDoesNotDowngradeMetadataSSE(t *testing.T) {
+	t.Parallel()
+	metadata := strings.Repeat("data: {\"type\":\"response.created\"}\n\n", 200)
+	_, downgraded, err := primeStreamingBody(io.NopCloser(strings.NewReader(metadata)), time.Second)
+	if !errors.Is(err, errStreamPrimeNoEvent) || downgraded {
+		t.Fatalf("metadata SSE must retry, downgraded=%v err=%v", downgraded, err)
+	}
+}
+
+func TestHasSSEFrameDistinguishesJSONBody(t *testing.T) {
+	if hasSSEFrame([]byte(`{"response":{"id":"resp_json"}}`)) {
+		t.Fatal("plain JSON incorrectly detected as SSE")
+	}
+	if !hasSSEFrame([]byte("event: response.created\ndata: {}\n\n")) {
+		t.Fatal("SSE frame not detected")
+	}
+}
+
 func TestPrimeStreamingBodyEmptyEOF(t *testing.T) {
 	t.Parallel()
 	src := io.NopCloser(strings.NewReader(""))
