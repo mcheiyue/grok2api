@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -59,7 +60,7 @@ func (p *primedBody) Close() error {
 }
 
 // primeStreamingBody blocks until the upstream body yields at least one
-// complete SSE event with a non-empty JSON `data:` payload (or fails/times out).
+// complete SSE event with a generated content payload (or fails/times out).
 // Keepalive comments (`: ...`) and bare whitespace do NOT count — that is the
 // fix for 200warn cases where "any 1 byte" released the body too early.
 //
@@ -67,8 +68,9 @@ func (p *primedBody) Close() error {
 // can hand the body to the client unchanged. On failure the original body is closed.
 //
 // The second return value (downgraded) is true when the body was treated as
-// non-SSE (e.g. a large JSON blob with Content-Type: text/event-stream) and
-// the caller should correct the Content-Type header to application/json.
+// non-SSE (e.g. a large JSON blob with Content-Type: text/event-stream). It is
+// only a handoff signal: the protocol layer must validate and convert the body
+// before sending it to a stream=true client.
 func primeStreamingBody(body io.ReadCloser, timeout time.Duration) (io.ReadCloser, bool, error) {
 	if body == nil {
 		return nil, false, &streamPrimeError{Err: errStreamPrimeEmpty}
@@ -122,10 +124,10 @@ func primeStreamingBody(body io.ReadCloser, timeout time.Duration) (io.ReadClose
 			}, false, nil
 		}
 		primeBytes := len(res.data)
-		// If the upstream sent significant data without valid SSE events, the
-		// response is likely non-SSE (e.g. a large JSON blob). Pass it through
-		// rather than failing and retrying. 4 KiB is a safe threshold: real
-		// responses will exceed it, keepalive/comment noise will not.
+		// If the upstream sent significant data without valid SSE events, hand it
+		// to the protocol layer for validation instead of retrying blindly. 4 KiB
+		// is a safe threshold: real responses will exceed it, keepalive/comment
+		// noise will not.
 		if primeBytes >= 4096 {
 			_ = body.Close()
 			return &primedBody{
@@ -156,8 +158,8 @@ func primeStreamingBody(body io.ReadCloser, timeout time.Duration) (io.ReadClose
 }
 
 // hasValidSSEDataEvent reports whether data contains at least one complete SSE
-// event (terminated by a blank line) with a non-empty JSON `data:` payload.
-// Keepalive comments and empty data lines do not qualify.
+// event (terminated by a blank line) with a generated content payload.
+// Metadata events such as response.created do not qualify.
 func hasValidSSEDataEvent(data []byte) bool {
 	if len(data) == 0 {
 		return false
@@ -172,14 +174,14 @@ func hasValidSSEDataEvent(data []byte) bool {
 		}
 		event := normalized[start : start+rel]
 		start += rel + 2
-		if sseEventHasJSONData(event) {
+		if sseEventHasGeneratedPayload(event) {
 			return true
 		}
 	}
 	return false
 }
 
-func sseEventHasJSONData(event []byte) bool {
+func sseEventHasGeneratedPayload(event []byte) bool {
 	for _, rawLine := range bytes.Split(event, []byte("\n")) {
 		line := bytes.TrimSpace(rawLine)
 		if len(line) == 0 || line[0] == ':' {
@@ -192,8 +194,38 @@ func sseEventHasJSONData(event []byte) bool {
 		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
 			continue
 		}
-		// Real upstream events are JSON objects/arrays.
-		if payload[0] == '{' || payload[0] == '[' {
+		if ssePayloadHasGeneratedDelta(payload) {
+			return true
+		}
+	}
+	return false
+}
+
+func ssePayloadHasGeneratedDelta(payload []byte) bool {
+	var event struct {
+		Type    string `json:"type"`
+		Delta   string `json:"delta"`
+		Choices []struct {
+			Delta struct {
+				Content          string `json:"content"`
+				Reasoning        string `json:"reasoning"`
+				ReasoningContent string `json:"reasoning_content"`
+				Refusal          string `json:"refusal"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if json.Unmarshal(payload, &event) != nil {
+		return false
+	}
+	switch event.Type {
+	case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.refusal.delta", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
+		return event.Delta != ""
+	case "content_block_delta":
+		return event.Delta != ""
+	}
+	for _, choice := range event.Choices {
+		delta := choice.Delta
+		if delta.Content != "" || delta.Reasoning != "" || delta.ReasoningContent != "" || delta.Refusal != "" {
 			return true
 		}
 	}

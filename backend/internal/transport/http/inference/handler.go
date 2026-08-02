@@ -1007,6 +1007,10 @@ func (h *Handler) writeProtocolResult(c *gin.Context, result *gateway.Result, st
 		if metadata.StreamFailure != nil && result.RecordStreamFailure != nil {
 			result.RecordStreamFailure(*metadata.StreamFailure)
 		}
+	} else if stream && protocol == streamProtocolResponses {
+		c.Header("Content-Type", "text/event-stream")
+		metadata, copyErr := copyJSONAsResponsesStream(c.Writer, result.Body, result.MarkFirstToken)
+		usage, responseID, err = metadata.Usage, metadata.ResponseID, copyErr
 	} else {
 		metadata, copyErr := copyJSON(c.Writer, result.Body, protocol)
 		usage, responseID, err = metadata.Usage, metadata.ResponseID, copyErr
@@ -1111,6 +1115,55 @@ func copyJSON(writer gin.ResponseWriter, source io.Reader, protocol streamProtoc
 			return responseMetadata{}, readErr
 		}
 	}
+}
+
+func copyJSONAsResponsesStream(writer gin.ResponseWriter, source io.Reader, onFirstToken func()) (responseMetadata, error) {
+	body, err := io.ReadAll(io.LimitReader(source, maxStreamResponseTransferBytes+1))
+	if err != nil {
+		return responseMetadata{}, err
+	}
+	if int64(len(body)) > maxStreamResponseTransferBytes {
+		return responseMetadata{}, fmt.Errorf("%w: 流式响应超过 %d MiB", errResponseTransferLimit, maxStreamResponseTransferBytes>>20)
+	}
+
+	var envelope struct {
+		Response json.RawMessage `json:"response"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return responseMetadata{}, fmt.Errorf("响应不是有效 JSON: %w", err)
+	}
+	response := bytes.TrimSpace(envelope.Response)
+	if len(response) == 0 || bytes.Equal(response, []byte("null")) {
+		response = bytes.TrimSpace(body)
+	}
+	if len(response) == 0 || bytes.Equal(response, []byte("null")) {
+		return responseMetadata{}, errors.New("Responses 响应缺少 response 对象")
+	}
+
+	payload, err := json.Marshal(struct {
+		Type     string          `json:"type"`
+		Response json.RawMessage `json:"response"`
+	}{Type: "response.completed", Response: response})
+	if err != nil {
+		return responseMetadata{}, err
+	}
+	frame := append([]byte("data: "), payload...)
+	frame = append(frame, '\n', '\n')
+	if err := setResponseWriteDeadline(writer); err != nil {
+		return responseMetadata{}, err
+	}
+	if _, err := writer.Write(frame); err != nil {
+		return responseMetadata{}, err
+	}
+	writer.Flush()
+	if onFirstToken != nil {
+		onFirstToken()
+	}
+
+	inspector := &responseInspector{protocol: streamProtocolResponses}
+	inspector.Inspect(frame)
+	inspector.Finish()
+	return inspector.Metadata(), inspector.TerminalError()
 }
 
 type responseInspector struct {

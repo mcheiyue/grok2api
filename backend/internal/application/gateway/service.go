@@ -1109,9 +1109,9 @@ attemptLoop:
 			// API blob). The prime detects it and downgrades the Content-Type
 			// to application/json so the client does not attempt SSE parsing.
 			if isSSEContentType(response.Header) {
-				// Wait for a complete SSE data event (JSON), not merely any byte —
-				// keepalive/comment bytes previously caused false prime success
-				// and left classic 200warn (0 tokens, attempt=0) to the client.
+				// Wait for a complete generated payload, not merely a metadata event —
+				// response.created previously caused false prime success and left
+				// classic 200warn (0 tokens, attempt=0) to the client.
 				primed, downgraded, primeErr := primeStreamingBody(response.Body, streamPrimeTimeout)
 				if primeErr != nil {
 					lastFailure = &UpstreamFailure{

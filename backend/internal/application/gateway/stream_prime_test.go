@@ -40,7 +40,7 @@ func (s *stallReader) Close() error { return nil }
 
 func TestPrimeStreamingBodyReplaysValidSSE(t *testing.T) {
 	t.Parallel()
-	src := io.NopCloser(strings.NewReader("data: {\"type\":\"response.created\"}\n\nrest"))
+	src := io.NopCloser(strings.NewReader("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\nrest"))
 	primed, downgraded, err := primeStreamingBody(src, time.Second)
 	if err != nil {
 		t.Fatalf("prime: %v", err)
@@ -53,7 +53,7 @@ func TestPrimeStreamingBodyReplaysValidSSE(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read all: %v", err)
 	}
-	if got := string(all); got != "data: {\"type\":\"response.created\"}\n\nrest" {
+	if got := string(all); got != "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\nrest" {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -73,7 +73,7 @@ func TestPrimeStreamingBodyRejectsKeepaliveOnly(t *testing.T) {
 
 func TestPrimeStreamingBodyWaitsPastKeepaliveForJSON(t *testing.T) {
 	t.Parallel()
-	src := io.NopCloser(strings.NewReader(": ping\n\ndata: {\"type\":\"response.created\"}\n\nmore"))
+	src := io.NopCloser(strings.NewReader(": ping\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\nmore"))
 	primed, downgraded, err := primeStreamingBody(src, time.Second)
 	if err != nil {
 		t.Fatalf("prime: %v", err)
@@ -83,8 +83,17 @@ func TestPrimeStreamingBodyWaitsPastKeepaliveForJSON(t *testing.T) {
 	}
 	defer primed.Close()
 	all, _ := io.ReadAll(primed)
-	if !strings.Contains(string(all), `"response.created"`) || !strings.HasSuffix(string(all), "more") {
+	if !strings.Contains(string(all), `"response.output_text.delta"`) || !strings.HasSuffix(string(all), "more") {
 		t.Fatalf("got %q", all)
+	}
+}
+
+func TestPrimeStreamingBodyRejectsMetadataBeforePayload(t *testing.T) {
+	t.Parallel()
+	src := io.NopCloser(strings.NewReader("data: {\"type\":\"response.created\"}\n\n"))
+	_, _, err := primeStreamingBody(src, time.Second)
+	if !errors.Is(err, errStreamPrimeNoEvent) {
+		t.Fatalf("want metadata-only stream rejected, got %v", err)
 	}
 }
 
@@ -99,7 +108,7 @@ func TestPrimeStreamingBodyEmptyEOF(t *testing.T) {
 
 func TestPrimeStreamingBodyTimeout(t *testing.T) {
 	t.Parallel()
-	src := &stallReader{delay: 200 * time.Millisecond, data: "data: {\"type\":\"response.created\"}\n\n"}
+	src := &stallReader{delay: 200 * time.Millisecond, data: "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"}
 	_, _, err := primeStreamingBody(src, 20*time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "prime timeout") {
 		t.Fatalf("want prime timeout, got %v", err)
@@ -126,10 +135,11 @@ func TestHasValidSSEDataEvent(t *testing.T) {
 		{": ping\n\n", false},
 		{"data: \n\n", false},
 		{"data: [DONE]\n\n", false},
-		{"data: {\"type\":\"response.created\"}\n\n", true},
-		{": ping\n\ndata: {\"a\":1}\n\n", true},
+		{"data: {\"type\":\"response.created\"}\n\n", false},
+		{"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n", true},
+		{": ping\n\ndata: {\"a\":1}\n\n", false},
 		{"data: {\"type\":\"response.created\"}\n", false}, // incomplete event
-		{"event: message\ndata: {\"x\":1}\n\n", true},
+		{"event: message\ndata: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"x\"}\n\n", true},
 	}
 	for _, tc := range cases {
 		if got := hasValidSSEDataEvent([]byte(tc.in)); got != tc.want {
