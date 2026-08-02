@@ -1103,7 +1103,12 @@ attemptLoop:
 			// handing the body to the client. If the SSE dies empty (classic
 			// 200warn / upstream_stream_interrupted with 0 tokens), nothing has
 			// been written downstream yet — safe to rotate account and retry.
-			if input.Streaming && isSSEContentType(response.Header) {
+			//
+			// Also handles the case where upstream returns Content-Type:
+			// text/event-stream with a non-SSE JSON body (e.g. 57KB Responses
+			// API blob). The prime detects it and downgrades the Content-Type
+			// to application/json so the client does not attempt SSE parsing.
+			if isSSEContentType(response.Header) {
 				// Wait for a complete SSE data event (JSON), not merely any byte —
 				// keepalive/comment bytes previously caused false prime success
 				// and left classic 200warn (0 tokens, attempt=0) to the client.
