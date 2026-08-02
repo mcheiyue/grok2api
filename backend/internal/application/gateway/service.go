@@ -1099,62 +1099,6 @@ attemptLoop:
 			continue
 		}
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
-			// Option A: after 2xx headers, wait for the first stream byte before
-			// handing the body to the client. If the SSE dies empty (classic
-			// 200warn / upstream_stream_interrupted with 0 tokens), nothing has
-			// been written downstream yet — safe to rotate account and retry.
-			//
-			// Also handles the case where upstream returns Content-Type:
-			// text/event-stream with a non-SSE JSON body (e.g. 57KB Responses
-			// API blob). The prime detects it and downgrades the Content-Type
-			// to application/json so the client does not attempt SSE parsing.
-			if isSSEContentType(response.Header) {
-				// Wait for a complete generated payload, not merely a metadata event —
-				// response.created previously caused false prime success and left
-				// classic 200warn (0 tokens, attempt=0) to the client.
-				primed, downgraded, primeErr := primeStreamingBody(response.Body, streamPrimeTimeout)
-				if primeErr != nil {
-					lastFailure = &UpstreamFailure{
-						HTTPStatus:    http.StatusBadGateway,
-						Code:          "upstream_stream_interrupted",
-						PublicMessage: "上游流在有效首事件前中断",
-						AccountID:     credential.ID,
-						AccountName:   credential.Name,
-						Cause:         primeErr,
-						Fingerprint:   "stream_prime_failed",
-					}
-					lastErr = primeErr
-					s.logger.Warn("upstream_stream_prime_failed",
-						"request_id", input.RequestID,
-						"account_id", credential.ID,
-						"provider", credential.Provider,
-						"prime_bytes", primeBytesOf(primeErr),
-						"error", primeErr,
-					)
-					if markErr := s.selector.MarkFailureAfterSuccess(ctx, credential, http.StatusBadGateway, 0); markErr != nil {
-						s.logger.Warn("stream_prime_health_write_failed", "account_id", credential.ID, "provider", credential.Provider, "error", markErr)
-					}
-					lease.Release()
-					if ownership != nil {
-						// Pinned Responses stay on one account; do not spin.
-						break attemptLoop
-					}
-					failureFingerprints[lastFailure.Fingerprint]++
-					if failureFingerprints[lastFailure.Fingerprint] >= 2 {
-						break attemptLoop
-					}
-					continue attemptLoop
-				}
-				response.Body = primed
-				if downgraded {
-					// Upstream sent a non-SSE body (e.g. large JSON blob) with
-					// Content-Type: text/event-stream. Correct the header so the
-					// handler and client do not try to parse SSE events.
-					response.Header.Set("Content-Type", "application/json; charset=utf-8")
-				}
-			}
-			// Non-SSE responses (e.g. application/json) are passed through
-			// without priming — the entire body is consumed at once by the client.
 			s.selector.markSuccess(ctx, credential, lease.QuotaProbe)
 			if diagnostic := response.RecoveredPrimaryFailure; diagnostic != nil {
 				recoveredFailure := newHTTPUpstreamFailure(diagnostic.StatusCode, diagnostic.Body, credential.ID, credential.Name)
@@ -1718,15 +1662,4 @@ func firstError(values ...error) error {
 		}
 	}
 	return errors.New("未知上游错误")
-}
-
-// isSSEContentType returns true when the upstream response indicates it is a
-// Server-Sent Events stream. Non-SSE responses (plain JSON, etc.) skip the
-// stream prime because the entire body is consumed at once by the client.
-func isSSEContentType(header http.Header) bool {
-	if header == nil {
-		return false
-	}
-	ct := header.Get("Content-Type")
-	return strings.Contains(ct, "text/event-stream") || strings.Contains(ct, "application/x-ndjson")
 }

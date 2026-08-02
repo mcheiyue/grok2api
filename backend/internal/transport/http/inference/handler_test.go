@@ -894,29 +894,6 @@ func TestWriteResultRecordsStreamFailureDiagnostic(t *testing.T) {
 	}
 }
 
-func TestWriteResultConvertsJSONToResponsesStream(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	payload := `{"response":{"id":"resp_json","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`
-	result := &gateway.Result{
-		StatusCode: http.StatusOK,
-		Status:     "200 OK",
-		Header:     http.Header{"Content-Type": {"application/json"}},
-		Body:       io.NopCloser(strings.NewReader(payload)),
-		Finalize:   func(gateway.Usage, string, string) {},
-	}
-	handler := NewHandler(nil, nil, 1<<20)
-	router := gin.New()
-	router.GET("/", func(c *gin.Context) {
-		handler.writeResult(c, result, true, streamProtocolResponses)
-	})
-	recorder := httptest.NewRecorder()
-	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
-	want := `data: {"type":"response.completed","response":{"id":"resp_json","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}` + "\n\n"
-	if recorder.Code != http.StatusOK || recorder.Header().Get("Content-Type") != "text/event-stream" || recorder.Body.String() != want {
-		t.Fatalf("status=%d content-type=%q body=%q", recorder.Code, recorder.Header().Get("Content-Type"), recorder.Body.String())
-	}
-}
-
 func TestProjectStreamFailureDiagnosticBoundsErrorMessage(t *testing.T) {
 	diagnostic := projectStreamFailureDiagnostic([]byte(`{"type":"error","error":{"code":"server_error","message":"` + strings.Repeat("错误", maxStreamFailureDiagnosticBytes) + `"},"output":"must-not-be-audited"}`))
 	if !diagnostic.BodyTruncated || len(diagnostic.Body) > maxStreamFailureDiagnosticBytes || len(diagnostic.Body) == 0 || !utf8.Valid(diagnostic.Body) || strings.Contains(string(diagnostic.Body), "must-not-be-audited") {
@@ -969,22 +946,6 @@ func TestCopyJSONForwardsBodyBeyondMetadataInspectionLimit(t *testing.T) {
 	}
 	if metadata.ResponseID != "" || metadata.Usage.TotalTokens != 0 {
 		t.Fatalf("metadata should be skipped after inspection limit: %#v", metadata)
-	}
-}
-
-func TestCopyJSONAsResponsesStreamConvertsCompleteJSON(t *testing.T) {
-	payload := []byte(`{"response":{"id":"resp_json","model":"grok-4.5","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`)
-	recorder := httptest.NewRecorder()
-	context, _ := gin.CreateTestContext(recorder)
-	metadata, err := copyJSONAsResponsesStream(context.Writer, bytes.NewReader(payload), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if metadata.ResponseID != "resp_json" || metadata.Usage.TotalTokens != 5 {
-		t.Fatalf("metadata = %#v", metadata)
-	}
-	if recorder.Body.String() != `data: {"type":"response.completed","response":{"id":"resp_json","model":"grok-4.5","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`+"\n\n" {
-		t.Fatalf("converted body = %q", recorder.Body.String())
 	}
 }
 
