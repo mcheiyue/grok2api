@@ -41,9 +41,12 @@ func (s *stallReader) Close() error { return nil }
 func TestPrimeStreamingBodyReplaysValidSSE(t *testing.T) {
 	t.Parallel()
 	src := io.NopCloser(strings.NewReader("data: {\"type\":\"response.created\"}\n\nrest"))
-	primed, err := primeStreamingBody(src, time.Second)
+	primed, downgraded, err := primeStreamingBody(src, time.Second)
 	if err != nil {
 		t.Fatalf("prime: %v", err)
+	}
+	if downgraded {
+		t.Fatal("unexpected downgraded for valid SSE")
 	}
 	defer primed.Close()
 	all, err := io.ReadAll(primed)
@@ -59,7 +62,7 @@ func TestPrimeStreamingBodyRejectsKeepaliveOnly(t *testing.T) {
 	t.Parallel()
 	// Classic false prime: comment/keepalive bytes then EOF — must NOT succeed.
 	src := io.NopCloser(strings.NewReader(": keep-alive\n\n"))
-	_, err := primeStreamingBody(src, time.Second)
+	_, _, err := primeStreamingBody(src, time.Second)
 	if !errors.Is(err, errStreamPrimeNoEvent) {
 		t.Fatalf("want errStreamPrimeNoEvent, got %v", err)
 	}
@@ -71,9 +74,12 @@ func TestPrimeStreamingBodyRejectsKeepaliveOnly(t *testing.T) {
 func TestPrimeStreamingBodyWaitsPastKeepaliveForJSON(t *testing.T) {
 	t.Parallel()
 	src := io.NopCloser(strings.NewReader(": ping\n\ndata: {\"type\":\"response.created\"}\n\nmore"))
-	primed, err := primeStreamingBody(src, time.Second)
+	primed, downgraded, err := primeStreamingBody(src, time.Second)
 	if err != nil {
 		t.Fatalf("prime: %v", err)
+	}
+	if downgraded {
+		t.Fatal("unexpected downgraded for valid SSE")
 	}
 	defer primed.Close()
 	all, _ := io.ReadAll(primed)
@@ -85,7 +91,7 @@ func TestPrimeStreamingBodyWaitsPastKeepaliveForJSON(t *testing.T) {
 func TestPrimeStreamingBodyEmptyEOF(t *testing.T) {
 	t.Parallel()
 	src := io.NopCloser(strings.NewReader(""))
-	_, err := primeStreamingBody(src, time.Second)
+	_, _, err := primeStreamingBody(src, time.Second)
 	if !errors.Is(err, errStreamPrimeEmpty) {
 		t.Fatalf("want errStreamPrimeEmpty, got %v", err)
 	}
@@ -94,7 +100,7 @@ func TestPrimeStreamingBodyEmptyEOF(t *testing.T) {
 func TestPrimeStreamingBodyTimeout(t *testing.T) {
 	t.Parallel()
 	src := &stallReader{delay: 200 * time.Millisecond, data: "data: {\"type\":\"response.created\"}\n\n"}
-	_, err := primeStreamingBody(src, 20*time.Millisecond)
+	_, _, err := primeStreamingBody(src, 20*time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "prime timeout") {
 		t.Fatalf("want prime timeout, got %v", err)
 	}
@@ -104,7 +110,7 @@ func TestPrimeStreamingBodyReadError(t *testing.T) {
 	t.Parallel()
 	boom := errors.New("conn reset")
 	src := &stallReader{err: boom}
-	_, err := primeStreamingBody(src, time.Second)
+	_, _, err := primeStreamingBody(src, time.Second)
 	if !errors.Is(err, boom) {
 		t.Fatalf("want boom, got %v", err)
 	}

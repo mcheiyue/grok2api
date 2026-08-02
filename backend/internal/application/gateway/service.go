@@ -1107,7 +1107,7 @@ attemptLoop:
 				// Wait for a complete SSE data event (JSON), not merely any byte —
 				// keepalive/comment bytes previously caused false prime success
 				// and left classic 200warn (0 tokens, attempt=0) to the client.
-				primed, primeErr := primeStreamingBody(response.Body, streamPrimeTimeout)
+				primed, downgraded, primeErr := primeStreamingBody(response.Body, streamPrimeTimeout)
 				if primeErr != nil {
 					lastFailure = &UpstreamFailure{
 						HTTPStatus:    http.StatusBadGateway,
@@ -1141,6 +1141,12 @@ attemptLoop:
 					continue attemptLoop
 				}
 				response.Body = primed
+				if downgraded {
+					// Upstream sent a non-SSE body (e.g. large JSON blob) with
+					// Content-Type: text/event-stream. Correct the header so the
+					// handler and client do not try to parse SSE events.
+					response.Header.Set("Content-Type", "application/json; charset=utf-8")
+				}
 			}
 			// Non-SSE responses (e.g. application/json) are passed through
 			// without priming — the entire body is consumed at once by the client.

@@ -65,9 +65,13 @@ func (p *primedBody) Close() error {
 //
 // On success the returned ReadCloser replays the buffered head so the caller
 // can hand the body to the client unchanged. On failure the original body is closed.
-func primeStreamingBody(body io.ReadCloser, timeout time.Duration) (io.ReadCloser, error) {
+//
+// The second return value (downgraded) is true when the body was treated as
+// non-SSE (e.g. a large JSON blob with Content-Type: text/event-stream) and
+// the caller should correct the Content-Type header to application/json.
+func primeStreamingBody(body io.ReadCloser, timeout time.Duration) (io.ReadCloser, bool, error) {
 	if body == nil {
-		return nil, &streamPrimeError{Err: errStreamPrimeEmpty}
+		return nil, false, &streamPrimeError{Err: errStreamPrimeEmpty}
 	}
 	if timeout <= 0 {
 		timeout = streamPrimeTimeout
@@ -115,7 +119,7 @@ func primeStreamingBody(body io.ReadCloser, timeout time.Duration) (io.ReadClose
 			return &primedBody{
 				reader: io.MultiReader(bytes.NewReader(res.data), body),
 				closer: body,
-			}, nil
+			}, false, nil
 		}
 		primeBytes := len(res.data)
 		// If the upstream sent significant data without valid SSE events, the
@@ -127,24 +131,24 @@ func primeStreamingBody(body io.ReadCloser, timeout time.Duration) (io.ReadClose
 			return &primedBody{
 				reader: bytes.NewReader(res.data),
 				closer: io.NopCloser(nil),
-			}, nil
+			}, true, nil
 		}
 		_ = body.Close()
 		if primeBytes == 0 {
 			if res.err == nil || errors.Is(res.err, io.EOF) {
-				return nil, &streamPrimeError{Bytes: 0, Err: errStreamPrimeEmpty}
+				return nil, false, &streamPrimeError{Bytes: 0, Err: errStreamPrimeEmpty}
 			}
-			return nil, &streamPrimeError{Bytes: 0, Err: res.err}
+			return nil, false, &streamPrimeError{Bytes: 0, Err: res.err}
 		}
 		if res.err == nil || errors.Is(res.err, io.EOF) {
-			return nil, &streamPrimeError{Bytes: primeBytes, Err: errStreamPrimeNoEvent}
+			return nil, false, &streamPrimeError{Bytes: primeBytes, Err: errStreamPrimeNoEvent}
 		}
-		return nil, &streamPrimeError{Bytes: primeBytes, Err: res.err}
+		return nil, false, &streamPrimeError{Bytes: primeBytes, Err: res.err}
 	case <-timer.C:
 		_ = body.Close()
 		// Allow the blocked Read to unblock after Close without leaking the goroutine.
 		go func() { <-ch }()
-		return nil, &streamPrimeError{
+		return nil, false, &streamPrimeError{
 			Bytes: 0,
 			Err:   fmt.Errorf("upstream stream prime timeout after %s", timeout),
 		}
