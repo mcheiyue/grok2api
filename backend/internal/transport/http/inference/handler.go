@@ -1000,7 +1000,8 @@ func (h *Handler) writeProtocolResult(c *gin.Context, result *gateway.Result, st
 		errorCode = "upstream_error"
 	}
 	var err error
-	if stream {
+	useStream := stream && strings.HasPrefix(result.Header.Get("Content-Type"), "text/event-stream")
+	if useStream {
 		metadata, copyErr := copyStream(c.Writer, result.Body, protocol, result.MarkFirstToken)
 		usage, responseID, err = metadata.Usage, metadata.ResponseID, copyErr
 		if metadata.StreamFailure != nil && result.RecordStreamFailure != nil {
