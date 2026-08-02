@@ -139,7 +139,7 @@ func TestHasValidSSEDataEvent(t *testing.T) {
 		{"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n", true},
 		{": ping\n\ndata: {\"a\":1}\n\n", false},
 		{"data: {\"type\":\"response.created\"}\n", false}, // incomplete event
-		{"event: message\ndata: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"x\"}\n\n", true},
+		{"event: message\ndata: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"x\"}\n\n", false},
 	}
 	for _, tc := range cases {
 		if got := hasValidSSEDataEvent([]byte(tc.in)); got != tc.want {

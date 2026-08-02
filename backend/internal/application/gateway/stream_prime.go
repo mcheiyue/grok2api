@@ -218,7 +218,7 @@ func ssePayloadHasGeneratedDelta(payload []byte) bool {
 		return false
 	}
 	switch event.Type {
-	case "response.output_text.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.refusal.delta", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
+	case "response.output_text.delta", "response.refusal.delta", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
 		return event.Delta != ""
 	case "content_block_delta":
 		return event.Delta != ""
