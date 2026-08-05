@@ -63,7 +63,10 @@ var schemaIndexes = []string{
 	"CREATE INDEX IF NOT EXISTS idx_accounts_auto_clean_reauth_cursor ON provider_accounts(auth_status, enabled, id, reauth_marked_at)",
 	"CREATE INDEX IF NOT EXISTS idx_account_credentials_refresh_due ON account_credentials(refresh_due_at, account_id)",
 	"CREATE INDEX IF NOT EXISTS idx_quota_windows_due ON account_quota_windows(remaining, reset_at, account_id)",
-	"CREATE UNIQUE INDEX IF NOT EXISTS idx_model_routes_public_id ON model_routes(public_id)",
+	"CREATE INDEX IF NOT EXISTS idx_model_routes_public_id_lookup ON model_routes(public_id)",
+	// Catalog/discovered rows remain idempotent across concurrent syncs. Manual
+	// rows intentionally may share a public ID and form a route-target pool.
+	"CREATE UNIQUE INDEX IF NOT EXISTS uidx_model_routes_managed_public_id ON model_routes(public_id) WHERE origin IN ('catalog', 'discovered')",
 	"CREATE INDEX IF NOT EXISTS idx_model_routes_provider_upstream ON model_routes(provider, upstream_model)",
 	"CREATE INDEX IF NOT EXISTS idx_model_routes_created_id ON model_routes(created_at DESC, id DESC)",
 	"CREATE INDEX IF NOT EXISTS idx_model_routes_enabled ON model_routes(enabled, public_id, id)",
@@ -72,6 +75,7 @@ var schemaIndexes = []string{
 	"CREATE INDEX IF NOT EXISTS idx_account_model_quota_blocks_due ON account_model_quota_blocks(cooldown_until, account_id)",
 	"CREATE INDEX IF NOT EXISTS idx_client_keys_created_id ON client_keys(created_at DESC, id DESC)",
 	"CREATE INDEX IF NOT EXISTS idx_client_keys_status ON client_keys(enabled, expires_at, created_at DESC, id DESC)",
+	"CREATE UNIQUE INDEX IF NOT EXISTS idx_client_keys_internal_kind ON client_keys(internal_kind) WHERE internal_kind IS NOT NULL",
 	"CREATE INDEX IF NOT EXISTS idx_client_key_models_route_key ON client_key_models(model_route_id, client_key_id)",
 	"CREATE INDEX IF NOT EXISTS idx_billing_reservations_expiry ON billing_reservations(expires_at, client_key_id)",
 	"CREATE INDEX IF NOT EXISTS idx_egress_nodes_scope_health ON egress_nodes(scope, enabled, health DESC, id ASC)",
@@ -86,6 +90,7 @@ var schemaIndexes = []string{
 	"CREATE INDEX IF NOT EXISTS idx_response_ownership_expires_id ON response_ownership(expires_at, response_id)",
 	"CREATE INDEX IF NOT EXISTS idx_response_ownership_account ON response_ownership(account_id)",
 	"CREATE INDEX IF NOT EXISTS idx_response_ownership_client_key ON response_ownership(client_key_id)",
+	"CREATE INDEX IF NOT EXISTS idx_response_ownership_route ON response_ownership(model_route_id)",
 	"CREATE INDEX IF NOT EXISTS idx_web_response_states_expires_id ON web_response_states(expires_at, response_id)",
 	"CREATE INDEX IF NOT EXISTS idx_web_response_states_account ON web_response_states(account_id, created_at DESC)",
 	"CREATE INDEX IF NOT EXISTS idx_media_jobs_client_created ON media_jobs(client_key_id, created_at DESC)",
@@ -187,6 +192,9 @@ func (d *Database) initializeSchema(ctx context.Context) error {
 	if err := d.dropProviderUpstreamUniqueIndex(ctx); err != nil {
 		return fmt.Errorf("迁移模型路由上游唯一约束: %w", err)
 	}
+	if err := d.dropModelPublicIDUniqueIndex(ctx); err != nil {
+		return fmt.Errorf("迁移模型路由名称唯一约束: %w", err)
+	}
 	for _, statement := range schemaIndexes {
 		if err := db.Exec(statement).Error; err != nil {
 			return fmt.Errorf("初始化数据库索引: %w", err)
@@ -264,6 +272,16 @@ func (d *Database) dropRedundantResponseExpiryIndexes(ctx context.Context) error
 func (d *Database) dropProviderUpstreamUniqueIndex(ctx context.Context) error {
 	if err := d.db.WithContext(ctx).Exec("DROP INDEX IF EXISTS uidx_provider_upstream").Error; err != nil {
 		return fmt.Errorf("drop index uidx_provider_upstream: %w", err)
+	}
+	return nil
+}
+
+// dropModelPublicIDUniqueIndex upgrades the original one-route-per-name model.
+// A separately named non-unique lookup index and managed-route partial unique index are
+// recreated by schemaIndexes after this migration step.
+func (d *Database) dropModelPublicIDUniqueIndex(ctx context.Context) error {
+	if err := d.db.WithContext(ctx).Exec("DROP INDEX IF EXISTS idx_model_routes_public_id").Error; err != nil {
+		return fmt.Errorf("drop index idx_model_routes_public_id: %w", err)
 	}
 	return nil
 }

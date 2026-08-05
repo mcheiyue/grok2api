@@ -250,7 +250,7 @@ func appendReasoningModelAliases(items []modelListItem) []modelListItem {
 		result = append(result, item)
 	}
 	for _, item := range items {
-		for _, aliasID := range modeldomain.ReasoningAliasPublicIDs(item.ID) {
+		for _, aliasID := range modeldomain.ReasoningAliasPublicIDsForProvider(item.Provider, item.ID) {
 			if seen[aliasID] {
 				continue
 			}
@@ -1504,6 +1504,7 @@ type responseInputDetailsDTO struct {
 
 type responseOutputDetailsDTO struct {
 	ReasoningTokens int64 `json:"reasoning_tokens"`
+	ThinkingTokens  int64 `json:"thinking_tokens"`
 }
 
 type responseContextDetailsDTO struct {
@@ -1544,6 +1545,9 @@ func (value responseUsageDTO) toGatewayUsage(responseModel string) gateway.Usage
 	reasoning := value.OutputTokensDetails.ReasoningTokens
 	if reasoning == 0 {
 		reasoning = value.CompletionTokensDetails.ReasoningTokens
+	}
+	if reasoning == 0 {
+		reasoning = value.OutputTokensDetails.ThinkingTokens
 	}
 	return gateway.Usage{
 		InputTokens: input, CachedInputTokens: cached,
