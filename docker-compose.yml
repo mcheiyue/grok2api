@@ -38,6 +38,9 @@ services:
     cap_add:
       - NET_ADMIN
 
+# ================================ FLARESOLVERR ================================
+  # 在管理端将 Clearance 模式设为 FlareSolverr 并填刷新，例：http://flaresolverr:8191。
+  # 启动命令：docker compose --profile flaresolverr up -d
   flaresolverr:
     container_name: flaresolverr
     image: ghcr.io/flaresolverr/flaresolverr:latest

@@ -151,7 +151,7 @@ bootstrapAdmin:
 	if cfg.Routing.PreferFreeBuild {
 		t.Fatal("preferFreeBuild should retain its false default when omitted from YAML")
 	}
-	if cfg.Routing.SegmentedSelectorEnabled || cfg.Routing.SegmentedMinCandidates != 3000 || cfg.Routing.SegmentedWindowSize != 64 {
+	if !cfg.Routing.SegmentedSelectorEnabled || cfg.Routing.SegmentedMinCandidates != 3000 || cfg.Routing.SegmentedWindowSize != 64 {
 		t.Fatalf("segmented selector defaults = %#v", cfg.Routing)
 	}
 	if cfg.Accounts.AutoCleanReauthEnabled || cfg.Accounts.AutoCleanIncludeDisabled {
@@ -498,6 +498,17 @@ func TestValidateStatsigModes(t *testing.T) {
 	remote.Provider.Web.StatsigSignerURL = "http://signer.example.com:8788/sign"
 	if err := remote.Validate(); err == nil {
 		t.Fatal("public plaintext Statsig signer URL was accepted")
+	}
+}
+
+func TestValidateOnDemandClearance(t *testing.T) {
+	base := defaultConfig()
+	base.Secrets.JWTSecret = "12345678901234567890123456789012"
+	base.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	base.Provider.Web.ClearanceMode = ClearanceModeOnDemand
+	base.Provider.Web.FlareSolverrURL = "http://flaresolverr:8191"
+	if err := base.Validate(); err != nil {
+		t.Fatalf("valid on-demand Clearance rejected: %v", err)
 	}
 }
 
