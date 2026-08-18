@@ -94,6 +94,7 @@ type auditResponse struct {
 	Provider                string                    `json:"provider"`
 	Operation               string                    `json:"operation"`
 	UsageSource             string                    `json:"usageSource"`
+	ReasoningEffort         string                    `json:"reasoningEffort,omitempty"`
 	AccountID               *uint64                   `json:"accountId,string,omitempty"`
 	AccountName             string                    `json:"accountName,omitempty"`
 	EgressNodeID            *uint64                   `json:"egressNodeId,string,omitempty"`
@@ -474,7 +475,8 @@ func newAuditResponse(value auditdomain.Record) auditResponse {
 		ID: value.ID, RequestID: value.RequestID, ClientKeyID: value.ClientKeyID, ClientKeyName: value.ClientKeyName,
 		ModelRouteID: value.ModelRouteID, ModelPublicID: value.ModelPublicID, ModelUpstreamModel: value.ModelUpstreamModel,
 		Provider: value.Provider, Operation: string(value.Operation), UsageSource: string(value.UsageSource),
-		AccountID: value.AccountID, AccountName: value.AccountName,
+		ReasoningEffort: value.ReasoningEffort,
+		AccountID:       value.AccountID, AccountName: value.AccountName,
 		EgressNodeID: value.EgressNodeID, EgressNodeName: value.EgressNodeName, EgressScope: value.EgressScope, EgressMode: string(value.EgressMode),
 		StatusCode: value.StatusCode, Streaming: value.Streaming,
 		MediaInputImages: value.MediaInputImages, MediaOutputImages: value.MediaOutputImages, MediaOutputSeconds: value.MediaOutputSeconds,
@@ -535,6 +537,9 @@ func auditOutputTokensPerSecond(value auditdomain.Record) *float64 {
 	if !value.Streaming || value.StatusCode < 200 || value.StatusCode >= 300 || value.ErrorCode != "" || value.FirstTokenMS == nil || value.OutputTokens <= 0 || value.DurationMS <= *value.FirstTokenMS {
 		return nil
 	}
-	throughput := float64(value.OutputTokens) * 1000 / float64(value.DurationMS-*value.FirstTokenMS)
+	throughput := auditdomain.OutputTokensPerSecond(value.OutputTokens, value.ReasoningTokens, *value.FirstTokenMS, value.DurationMS)
+	if throughput <= 0 {
+		return nil
+	}
 	return &throughput
 }

@@ -351,7 +351,8 @@ func toAuditModels(value audit.Record) (requestAuditModel, []requestAuditAttempt
 		EventID: truncate(eventID, 64), RequestID: truncate(value.RequestID, 64), ClientKeyID: value.ClientKeyID, ClientKeyName: truncate(value.ClientKeyName, 160),
 		ModelRouteID: value.ModelRouteID, ModelPublicID: truncate(value.ModelPublicID, 255), ModelUpstreamModel: truncate(value.ModelUpstreamModel, 255),
 		Provider: truncate(provider, 32), Operation: string(operation), UsageSource: string(usageSource),
-		AccountID: value.AccountID, AccountName: truncate(value.AccountName, 160),
+		ReasoningEffort: audit.NormalizeReasoningEffort(value.ReasoningEffort),
+		AccountID:       value.AccountID, AccountName: truncate(value.AccountName, 160),
 		EgressNodeID: value.EgressNodeID, EgressNodeName: truncate(value.EgressNodeName, 160), EgressScope: truncate(value.EgressScope, 32), EgressMode: string(value.EgressMode),
 		StatusCode: value.StatusCode, Streaming: value.Streaming,
 		MediaInputImages: nonNegative(value.MediaInputImages), MediaOutputImages: nonNegative(value.MediaOutputImages), MediaOutputSeconds: nonNegative(value.MediaOutputSeconds),
@@ -911,7 +912,7 @@ func (r *AuditRepository) degradeClassifiedQuery(tx *gorm.DB, input repository.D
 	if r.db.dialect == "postgres" {
 		castType = "DOUBLE PRECISION"
 	}
-	generationExpression := "(a.duration_ms - a.first_token_ms)"
+	generationExpression := fmt.Sprintf("(CASE WHEN a.reasoning_tokens > 0 AND a.duration_ms - a.first_token_ms < a.first_token_ms AND a.duration_ms - a.first_token_ms < %d THEN a.duration_ms ELSE a.duration_ms - a.first_token_ms END)", audit.DefaultDegradeMinGenMS)
 	// NULLIF keeps PostgreSQL safe even if its planner evaluates the throughput
 	// expression before the duration guard in the WHERE clause.
 	tpsExpression := fmt.Sprintf("(CAST(a.output_tokens AS %s) * 1000.0 / NULLIF(%s, 0))", castType, generationExpression)
