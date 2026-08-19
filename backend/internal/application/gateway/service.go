@@ -32,6 +32,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
+	"github.com/chenyme/grok2api/backend/internal/pkg/requestmeta"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
@@ -107,6 +108,11 @@ type Input struct {
 	// GrokTurnIndex forwards only the turn supplied by a real Grok Shell client; the server never infers or increments it.
 	GrokTurnIndex string
 	Operation     audit.Operation
+	// auditOperation may classify a normal protocol request differently for
+	// operator visibility without changing routing or Provider semantics.
+	auditOperation audit.Operation
+	// skipQualityHold is set only by trusted gateway-side request classifiers.
+	skipQualityHold bool
 	// ForcedEgressNodeID is an internal-only administrator probe constraint.
 	// Public inference handlers never populate it.
 	ForcedEgressNodeID uint64
@@ -117,7 +123,10 @@ type Usage struct {
 	// zero value used when a response fails before usage is available. Token
 	// counts may legitimately all be zero, so the numeric fields cannot carry
 	// this presence information by themselves.
-	Reported               bool
+	Reported bool
+	// OutputObserved records that the transport actually forwarded generated
+	// content even when an interrupted upstream never emitted final usage.
+	OutputObserved         bool
 	InputTokens            int64
 	CachedInputTokens      int64
 	OutputTokens           int64
@@ -455,7 +464,9 @@ func (s *Service) UpdateMaxAttempts(maxAttempts int) { s.maxAttempts.Store(int64
 
 // UpdateVideoMaxAttempts configures create-phase account failover for video jobs.
 // 0 is treated as the general default pool size for legacy configs.
-func (s *Service) UpdateVideoMaxAttempts(maxAttempts int) { s.videoMaxAttempts.Store(int64(maxAttempts)) }
+func (s *Service) UpdateVideoMaxAttempts(maxAttempts int) {
+	s.videoMaxAttempts.Store(int64(maxAttempts))
+}
 
 // ConfigureConsoleTeamCircuit 热更新 Console team 熔断秒数（RPM/RPS/unknown）；≤0 回落默认。
 // 不清除已有冷却条目的 until（新 trip 用新秒数；remaining 仍按旧 until 生效至过期）。
@@ -497,8 +508,15 @@ func (s *Service) checkLedgerReady() error {
 
 func (s *Service) CreateResponse(ctx context.Context, input Input) (*Result, error) {
 	input.Operation = audit.OperationResponses
-	if isResponsesCompactionRequest(input.Body) {
+	switch classifyResponsesCompactionRequest(input.Body) {
+	case responsesCompactionTrigger:
 		input.Operation = audit.OperationCompaction
+	case responsesCompactionTUI:
+		// Grok TUI compaction is still a normal Responses request. Keep its
+		// routing, Provider normalization, and stored-response behavior intact;
+		// only its audit classification and quality-hold policy differ.
+		input.auditOperation = audit.OperationCompaction
+		input.skipQualityHold = true
 	}
 	return s.createResponseAt(ctx, input, "/responses")
 }
@@ -831,6 +849,10 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	if operation == "" {
 		operation = audit.OperationResponses
 	}
+	auditOperation := operation
+	if input.auditOperation != "" {
+		auditOperation = input.auditOperation
+	}
 	routes, aliasEffort, err := s.resolvePublicModelRoutes(ctx, input.PublicModel, input.ClientKey.AllowModelAliases)
 	if err != nil {
 		return nil, ErrModelNotFound
@@ -927,8 +949,9 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	logResponseMediaSummary(s.logger, input.RequestID, mediaSummary)
 	auditBase := audit.Record{
 		EventID: eventID, RequestID: input.RequestID, ClientKeyID: input.ClientKey.ID, ClientKeyName: input.ClientKey.Name,
+		ClientIP:     requestmeta.ClientIP(ctx),
 		ModelRouteID: route.ID, ModelPublicID: publicModel, ModelUpstreamModel: modeldomain.DisplayUpstreamModel(route.Provider, route.UpstreamModel),
-		Provider: string(route.Provider), Operation: operation, UsageSource: audit.UsageSourceNone, Streaming: input.Streaming,
+		Provider: string(route.Provider), Operation: auditOperation, UsageSource: audit.UsageSourceNone, Streaming: input.Streaming,
 		MediaInputImages: mediaSummary.InputImages,
 	}
 	if errors.Is(routeErr, clientkeyapp.ErrModelNotAllowed) {
@@ -1054,8 +1077,9 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 				lease.completeSelectorObservation(successful)
 				budget := newFinalizationBudget(string(operation), string(route.Provider))
 				if isUpstreamStreamFailure(errorCode) {
+					status, retryAfter := streamFailureHealthPenalty(errorCode, usage)
 					if err := budget.run("account_health", finalizationHealthBudget, func(stageCtx context.Context) error {
-						return s.selector.MarkFailureAfterSuccess(stageCtx, credential, 0, 0)
+						return s.selector.MarkFailureAfterSuccess(stageCtx, credential, status, retryAfter)
 					}); err != nil {
 						s.logger.Warn("stream_failure_health_write_failed", "account_id", credential.ID, "provider", credential.Provider, "error", err)
 					}
@@ -1536,17 +1560,36 @@ attemptLoop:
 					}
 					lease.Release()
 					lastErr = peekErr
-					if ctx.Err() != nil || errors.Is(peekErr, context.Canceled) {
+					if isClientRequestCancel(ctx, peekErr) {
 						lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), peekErr)}
 						break
 					}
 					lastFailure = newTransportUpstreamFailure(peekErr, credential.ID, credential.Name)
+					if neterrorpkg.IsUpstreamStreamIdleTimeout(peekErr) || neterrorpkg.IsUpstreamStreamIdleTimeout(context.Cause(ctx)) || errors.Is(peekErr, errQualityEmptyStream) {
+						logPrefix := "quality_peek_idle"
+						if errors.Is(peekErr, errQualityEmptyStream) {
+							logPrefix = "quality_peek_empty"
+						}
+						writeCtx, writeCancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
+						if markErr := s.selector.MarkFailureAfterSuccess(writeCtx, credential, http.StatusGatewayTimeout, qualityIdleAccountCooldown); markErr != nil {
+							s.logger.Warn(logPrefix+"_cooldown_failed", "request_id", input.RequestID, "account_id", credential.ID, "error", markErr)
+						} else {
+							s.logger.Warn(logPrefix+"_retry", "request_id", input.RequestID, "account_id", credential.ID, "cooldown", qualityIdleAccountCooldown)
+						}
+						writeCancel()
+					}
+					if shouldStopForNonAccountFingerprint(failureFingerprints, lastFailure) {
+						break
+					}
 					continue
 				}
 				response.Body = replay
 				hasNextAccount := attemptPolicy.hasNext(attempt) && selection.hasAvailableCandidate(excluded, !quotaProbeAttempted)
 				hasNextAccount = hasNextAccount && qualityAccountAttempts < holdCfg.MaxAttempts
 				commit := CommitQualityHold(verdict, qualityAccountAttempts-1, holdCfg.MaxAttempts, hasNextAccount, holdCfg.OnExhausted)
+				if verdict == QualityWithhold {
+					s.applyMissingThinkingPenalty(ctx, input.RequestID, credential, holdCfg.AccountCooldown)
+				}
 				deferFailOpenAudit := commit.Action == QualityActionRetry && holdCfg.OnExhausted == qualityRetryFailOpen
 				if commit.Audit && !deferFailOpenAudit {
 					s.recordQualityDegraded(ctx, auditBase, credential, peekUsage, startedAt, egressTrace, route.Provider)
@@ -1708,11 +1751,18 @@ attemptLoop:
 
 func isUpstreamStreamFailure(errorCode string) bool {
 	switch errorCode {
-	case "upstream_stream_incomplete", "upstream_stream_interrupted":
+	case "upstream_stream_incomplete", "upstream_stream_interrupted", "upstream_stream_idle_timeout":
 		return true
 	default:
 		return false
 	}
+}
+
+func streamFailureHealthPenalty(errorCode string, usage Usage) (int, time.Duration) {
+	if errorCode == "upstream_stream_idle_timeout" && !usage.OutputObserved && usage.OutputTokens == 0 && usage.ReasoningTokens == 0 {
+		return http.StatusGatewayTimeout, qualityIdleAccountCooldown
+	}
+	return 0, 0
 }
 
 // auditRequestSucceeded keeps transport truth (the HTTP status) separate from
@@ -2011,7 +2061,7 @@ func shouldStopForNonAccountFingerprint(fingerprints map[string]int, failure *Up
 	}
 	fingerprints[failure.Fingerprint]++
 	limit := nonAccountFailureFingerprintLimit
-	if failure.Code == "upstream_stream_idle_timeout" || failure.Fingerprint == "upstream_stream_idle_timeout" {
+	if failure.Code == "upstream_stream_idle_timeout" || failure.Fingerprint == "upstream_stream_idle_timeout" || failure.Code == "upstream_stream_empty" || failure.Fingerprint == "upstream_stream_empty" {
 		limit = streamIdleFailureFingerprintLimit
 	}
 	return fingerprints[failure.Fingerprint] >= limit

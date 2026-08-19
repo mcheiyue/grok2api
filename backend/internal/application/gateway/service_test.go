@@ -29,6 +29,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	"github.com/chenyme/grok2api/backend/internal/pkg/requestmeta"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
@@ -272,6 +273,42 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 		t.Fatalf("compaction response ownership err = %v", err)
 	}
 
+	// Grok TUI compaction is a normal Responses request on the wire. It skips
+	// the quality hold and is labeled compaction only in the audit record, so
+	// Provider routing and stored-response ownership must remain intact.
+	service.UpdateQualityRetry(QualityRetryRuntime{
+		Enabled: true, MaxAttempts: 2, MinOutputTokens: 32,
+		OnExhausted: qualityRetryFailClosed, HoldTimeout: time.Second,
+	})
+	adapter.resetAttempts()
+	tuiCompacted, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-tui-compact", ClientKey: clientKey, PublicModel: "grok-test", PromptCacheSeed: "tui-session",
+		Body: []byte(`{"model":"grok-test","stream":true,"input":[{"role":"user","content":"` + tuiCompactionPrompt + `"}]}`), Streaming: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tuiBody, err := io.ReadAll(tuiCompacted.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(tuiBody) != "ok" {
+		t.Fatalf("TUI compaction body = %q", tuiBody)
+	}
+	tuiCompacted.MarkFirstToken()
+	tuiCompacted.Finalize(Usage{}, "resp-tui-compact", "")
+	_ = tuiCompacted.Body.Close()
+	if len(adapter.attempts) != 1 || adapter.lastOperation != string(audit.OperationResponses) {
+		t.Fatalf("TUI compaction attempts = %#v, Provider operation = %q", adapter.attempts, adapter.lastOperation)
+	}
+	logs, total, err = auditRepo.List(ctx, 0, 10)
+	if err != nil || total != 3 || logs[0].Operation != audit.OperationCompaction {
+		t.Fatalf("TUI compaction audit = %#v, total=%d, err=%v", logs, total, err)
+	}
+	if ownership, err := responseRepo.Get(ctx, "resp-tui-compact", clientKey.ID, time.Now().UTC()); err != nil || ownership.AccountID != second.ID {
+		t.Fatalf("TUI compaction ownership = %#v, err=%v", ownership, err)
+	}
+
 	adapter.resetAttempts()
 	continued, err := service.CreateResponse(ctx, Input{RequestID: "req-2", ClientKey: clientKey, PublicModel: "grok-test", PreviousResponseID: "resp-test", Body: []byte(`{"model":"grok-test","previous_response_id":"resp-test"}`)})
 	if err != nil {
@@ -379,7 +416,7 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	selector.accounts = healthBlocker
 	finalized := make(chan struct{})
 	go func() {
-		interrupted.Finalize(Usage{}, "", "upstream_stream_incomplete")
+		interrupted.Finalize(Usage{}, "", "upstream_stream_idle_timeout")
 		close(finalized)
 	}()
 	select {
@@ -402,8 +439,12 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	}
 	_ = interrupted.Body.Close()
 	interruptedAccount, err := accountRepo.Get(ctx, adapter.attempts[0])
-	if err != nil || interruptedAccount.FailureCount != 0 || interruptedAccount.CooldownUntil == nil {
+	if err != nil || interruptedAccount.FailureCount != 1 || interruptedAccount.CooldownUntil == nil {
 		t.Fatalf("interrupted account health = %#v, err=%v", interruptedAccount, err)
+	}
+	remaining := time.Until(*interruptedAccount.CooldownUntil)
+	if remaining < 23*time.Hour || remaining > 24*time.Hour+time.Minute {
+		t.Fatalf("idle stream cooldown = %s, want about 24h", remaining)
 	}
 }
 
@@ -2382,7 +2423,8 @@ func TestImageStreamPropagatesWithoutTouchingChatQuota(t *testing.T) {
 	service.UpdateMaxAttempts(3)
 	attemptsBeforeFailure := len(adapter.Attempts())
 	adapter.FailWithEgress(infraegress.NewManager(relational.NewEgressRepository(database), testCipher(t)))
-	if _, err := service.GenerateImage(ctx, ImageGenerationInput{
+	failureCtx := requestmeta.WithClientIP(ctx, "203.0.113.51")
+	if _, err := service.GenerateImage(failureCtx, ImageGenerationInput{
 		RequestID: "req-image-failed", ClientKey: key, PublicModel: "grok-imagine-image",
 		Prompt: "test", Count: 1, Resolution: "1k", ResponseFormat: "url",
 	}); err == nil {
@@ -2396,7 +2438,7 @@ func TestImageStreamPropagatesWithoutTouchingChatQuota(t *testing.T) {
 		t.Fatalf("failure audit logs=%#v total=%d err=%v", logs, total, err)
 	}
 	failureAudit := logs[0]
-	if failureAudit.RequestID != "req-image-failed" || failureAudit.StatusCode != http.StatusBadGateway || failureAudit.ErrorCode != "upstream_unavailable" || failureAudit.MediaOutputImages != 0 || failureAudit.EstimatedCostInUSDTicks != 0 || failureAudit.EgressMode != audit.EgressModeDirect || failureAudit.EgressScope != string(egressdomain.ScopeWeb) || failureAudit.EgressNodeName != "direct" {
+	if failureAudit.ClientIP != "203.0.113.51" || failureAudit.RequestID != "req-image-failed" || failureAudit.StatusCode != http.StatusBadGateway || failureAudit.ErrorCode != "upstream_unavailable" || failureAudit.MediaOutputImages != 0 || failureAudit.EstimatedCostInUSDTicks != 0 || failureAudit.EgressMode != audit.EgressModeDirect || failureAudit.EgressScope != string(egressdomain.ScopeWeb) || failureAudit.EgressNodeName != "direct" {
 		t.Fatalf("failure audit = %#v", failureAudit)
 	}
 	updatedKey, err := keyRepo.Get(ctx, key.ID)
@@ -2598,6 +2640,7 @@ type failoverAdapter struct {
 	lastPromptCacheKey     string
 	lastReasoningReplayKey string
 	lastGrokTurnIndex      string
+	lastOperation          string
 	reasoningEffort        string
 	forwardedModels        []string
 	resourceStatus         int
@@ -3307,7 +3350,8 @@ func TestGatewayExhausted429PreservesLastBodyInFailure(t *testing.T) {
 	audits := &attemptCapturingAudit{inner: auditRepo}
 	service := NewService(modelRepo, audits, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 2)
 
-	_, err = service.CreateResponse(ctx, Input{
+	requestCtx := requestmeta.WithClientIP(ctx, "2001:db8::42")
+	_, err = service.CreateResponse(requestCtx, Input{
 		RequestID: "req-body-429", ClientKey: clientKey, PublicModel: "grok-body",
 		Body: []byte(`{"model":"grok-body","input":"hello"}`),
 	})
@@ -3317,6 +3361,9 @@ func TestGatewayExhausted429PreservesLastBodyInFailure(t *testing.T) {
 	}
 	if upstreamFailure.HTTPStatus != http.StatusTooManyRequests {
 		t.Fatalf("status = %d", upstreamFailure.HTTPStatus)
+	}
+	if audits.last.ClientIP != "2001:db8::42" {
+		t.Fatalf("client IP = %q", audits.last.ClientIP)
 	}
 	if len(audits.last.Attempts) < 2 {
 		t.Fatalf("attempts = %#v", audits.last.Attempts)
@@ -4160,6 +4207,7 @@ func (a *failoverAdapter) ForwardResponse(_ context.Context, request provider.Re
 	a.lastPromptCacheKey = request.PromptCacheKey
 	a.lastReasoningReplayKey = request.ReasoningReplayKey
 	a.lastGrokTurnIndex = request.GrokTurnIndex
+	a.lastOperation = request.Operation
 	resourceStatus := a.resourceStatus
 	transportErr := a.transportErrorIDs[request.Credential.ID]
 	a.mu.Unlock()
@@ -4200,6 +4248,7 @@ func (a *failoverAdapter) resetAttempts() {
 	a.lastPromptCacheKey = ""
 	a.lastReasoningReplayKey = ""
 	a.lastGrokTurnIndex = ""
+	a.lastOperation = ""
 }
 
 func (a *failoverAdapter) ForwardedModels() []string {
@@ -4273,6 +4322,7 @@ func TestAuditRequestSucceeded(t *testing.T) {
 		{name: "2xx without error succeeds", statusCode: 200, errorCode: "", want: true},
 		{name: "2xx stream interruption fails", statusCode: 200, errorCode: "upstream_stream_interrupted", want: false},
 		{name: "2xx stream incomplete fails", statusCode: 200, errorCode: "upstream_stream_incomplete", want: false},
+		{name: "2xx stream idle timeout fails", statusCode: 200, errorCode: "upstream_stream_idle_timeout", want: false},
 		{name: "any 2xx error fails", statusCode: 201, errorCode: "stream_interrupted", want: false},
 		{name: "4xx fails", statusCode: 404, errorCode: "upstream_error", want: false},
 		{name: "5xx fails", statusCode: 502, errorCode: "upstream_server_error", want: false},
@@ -4283,5 +4333,35 @@ func TestAuditRequestSucceeded(t *testing.T) {
 				t.Fatalf("auditRequestSucceeded(%d, %q) = %t, want %t", tc.statusCode, tc.errorCode, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestIsUpstreamStreamFailureIncludesIdleTimeout(t *testing.T) {
+	if !isUpstreamStreamFailure("upstream_stream_idle_timeout") {
+		t.Fatal("idle timeout must cool the hanging account")
+	}
+	if !isUpstreamStreamFailure("upstream_stream_interrupted") || !isUpstreamStreamFailure("upstream_stream_incomplete") {
+		t.Fatal("existing stream-failure codes must stay classified")
+	}
+	if isUpstreamStreamFailure("") || isUpstreamStreamFailure("quality_degraded") {
+		t.Fatal("non-stream codes must not look like mid-stream failures")
+	}
+}
+
+func TestStreamFailureHealthPenaltyOnlyLongCoolsTrulyEmptyIdle(t *testing.T) {
+	t.Parallel()
+	status, cooldown := streamFailureHealthPenalty("upstream_stream_idle_timeout", Usage{})
+	if status != http.StatusGatewayTimeout || cooldown != qualityIdleAccountCooldown {
+		t.Fatalf("empty idle penalty = (%d, %s)", status, cooldown)
+	}
+	for _, usage := range []Usage{
+		{OutputObserved: true},
+		{OutputTokens: 1},
+		{ReasoningTokens: 1},
+	} {
+		status, cooldown = streamFailureHealthPenalty("upstream_stream_idle_timeout", usage)
+		if status != 0 || cooldown != 0 {
+			t.Fatalf("non-empty idle usage %#v received long penalty (%d, %s)", usage, status, cooldown)
+		}
 	}
 }
