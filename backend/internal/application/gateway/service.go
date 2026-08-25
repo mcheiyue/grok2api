@@ -1780,18 +1780,14 @@ attemptLoop:
 	if lastErr == nil {
 		lastErr = ErrNoAvailableAccount
 	}
-	// 选号层 SelectionUnavailableError 原样上抛（含冷却/额度原因）。
+	// 选号层 SelectionUnavailableError：审计按原因映射状态码；错误仍以
+	// ErrNoAvailableAccount 包装上抛（与上游契约一致，质量探针依赖该哨兵识别）。
 	var selectionFailure *SelectionUnavailableError
 	if errors.As(lastErr, &selectionFailure) {
 		record := auditBase
-		status, code := http.StatusServiceUnavailable, "upstream_unavailable"
-		switch selectionFailure.Reason {
-		case SelectionCooling, SelectionModelCooling, SelectionTeamRateLimit, SelectionQuotaExhausted:
-			status, code = http.StatusTooManyRequests, string(selectionFailure.Reason)
-		}
-		record.StatusCode = status
+		record.StatusCode = selectionFailure.HTTPStatus()
+		record.ErrorCode = selectionFailure.Code()
 		record.DurationMS = time.Since(startedAt).Milliseconds()
-		record.ErrorCode = code
 		record.Attempts = failureAttempts.snapshot()
 		record.CreatedAt = time.Now().UTC()
 		applyAuditEgress(&record, egressTrace, route.Provider)
@@ -1800,7 +1796,7 @@ attemptLoop:
 		if err := s.audits.Create(persistCtx, record); err != nil {
 			s.logger.Error("request_usage_write_failed", "event_id", record.EventID, "request_id", input.RequestID, "error", err)
 		}
-		return nil, selectionFailure
+		return nil, fmt.Errorf("%w: %w", ErrNoAvailableAccount, selectionFailure)
 	}
 	record := auditBase
 	record.StatusCode = http.StatusServiceUnavailable
