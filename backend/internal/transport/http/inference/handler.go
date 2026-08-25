@@ -1296,9 +1296,11 @@ func (h *Handler) writeProtocolResult(c *gin.Context, result *gateway.Result, st
 		errorCode = "upstream_error"
 	}
 	var err error
+	var streamFailure *gateway.StreamFailureDiagnostic
 	if stream {
 		metadata, copyErr := copyStreamWithFallbackModel(c.Writer, result.Body, protocol, result.MarkFirstToken, fallbackModel)
 		usage, responseID, err = metadata.Usage, metadata.ResponseID, copyErr
+		streamFailure = metadata.StreamFailure
 		if metadata.StreamFailure != nil && result.RecordStreamFailure != nil {
 			result.RecordStreamFailure(*metadata.StreamFailure)
 		}
@@ -1311,7 +1313,11 @@ func (h *Handler) writeProtocolResult(c *gin.Context, result *gateway.Result, st
 		case errors.Is(err, errResponseTransferLimit):
 			errorCode = "response_too_large"
 		case errors.Is(err, errUpstreamStreamFailed):
-			errorCode = "upstream_stream_error"
+			if streamFailureIsCapacity(streamFailure) {
+				errorCode = "upstream_capacity_error"
+			} else {
+				errorCode = "upstream_stream_error"
+			}
 		case errors.Is(err, errUpstreamStreamIncomplete):
 			errorCode = "upstream_stream_incomplete"
 		case errors.Is(err, neterror.ErrUpstreamStreamIdleTimeout):
@@ -1324,6 +1330,17 @@ func (h *Handler) writeProtocolResult(c *gin.Context, result *gateway.Result, st
 			errorCode = "stream_interrupted"
 		}
 	}
+}
+
+// upstreamCapacityMarker 匹配 xAI 模型级容量满载文案。该错误与账号健康无关，
+// 换号无意义；仅改写审计错误码以便与真实断流区分，客户端仍收到原始透传体。
+const upstreamCapacityMarker = "at capacity due to high demand"
+
+func streamFailureIsCapacity(failure *gateway.StreamFailureDiagnostic) bool {
+	if failure == nil {
+		return false
+	}
+	return bytes.Contains(failure.Body, []byte(upstreamCapacityMarker))
 }
 
 // peekNonEmptyJSONBody delays the downstream 2xx status until the upstream has
