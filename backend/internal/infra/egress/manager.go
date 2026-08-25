@@ -48,7 +48,9 @@ const clearanceCacheEvictionBatch = 256
 const clientClosedRequestStatus = 499
 const egressIPv4ProbeEndpoint = "https://ipinfo.io/json"
 const egressIPv6ProbeEndpoint = "https://v6.ipinfo.io/json"
-const cloudflareIPv4ProbeEndpoint = "https://1.1.1.1/cdn-cgi/trace"
+// 探针走域名而非裸 IP：经 Resin 等代理出口访问 https://1.1.1.1 时，
+// 证书 SAN 不含 IP 导致 x509 校验必败，探针恒 unhealthy 而真实业务正常。
+const cloudflareIPv4ProbeEndpoint = "https://cloudflare.com/cdn-cgi/trace"
 const cloudflareIPv6ProbeEndpoint = "https://[2606:4700:4700::1111]/cdn-cgi/trace"
 const egressProbeTimeout = 15 * time.Second
 const failureProbeCompletionGrace = 5 * time.Second
