@@ -48,9 +48,12 @@ const clearanceCacheEvictionBatch = 256
 const clientClosedRequestStatus = 499
 const egressIPv4ProbeEndpoint = "https://ipinfo.io/json"
 const egressIPv6ProbeEndpoint = "https://v6.ipinfo.io/json"
-// 探针走域名而非裸 IP：经 Resin 等代理出口访问 https://1.1.1.1 时，
-// 证书 SAN 不含 IP 导致 x509 校验必败，探针恒 unhealthy 而真实业务正常。
+// ipv4 探针采用候选序列：不同代理出口对 Cloudflare 呈现的地址族不同。
+// Resin 等常规代理访问裸 IP https://1.1.1.1 时证书 SAN 不含 IP（x509 必败），首选须为域名；
+// WARP 类出口访问 CF 自家域名时流量经内部 IPv6 路径，trace 报告的是 v6 出口，
+// 拿不到合法 v4，此时回落裸 IP 端点（其出口报告为 v4）。
 const cloudflareIPv4ProbeEndpoint = "https://cloudflare.com/cdn-cgi/trace"
+const cloudflareIPv4ProbeFallbackEndpoint = "https://1.1.1.1/cdn-cgi/trace"
 const cloudflareIPv6ProbeEndpoint = "https://[2606:4700:4700::1111]/cdn-cgi/trace"
 const egressProbeTimeout = 15 * time.Second
 const failureProbeCompletionGrace = 5 * time.Second
@@ -523,22 +526,27 @@ func (m *Manager) ProbeEgressNode(ctx context.Context, node domain.Node) (domain
 		m.logProbeSetupFailure(ctx, node, provider, stage, message, prepareErr, result.LatencyMS)
 		return result, prepareErr
 	}
-	ipv4Endpoint, ipv6Endpoint := probeEndpoints(provider)
-	outcomes := make(chan outcome, 2)
-	for _, probe := range []struct{ family, endpoint string }{{"ipv4", ipv4Endpoint}, {"ipv6", ipv6Endpoint}} {
-		go func() {
-			result, err := m.probeEgressEndpoint(ctx, target, provider, probe.family, probe.endpoint)
-			outcomes <- outcome{family: probe.family, result: result, err: err}
-		}()
+	targets := probeTargets(provider)
+	outcomes := make(chan outcome, len(targets))
+	for _, probe := range targets {
+		go func(p probeTarget) {
+			result, err := m.probeEgressEndpoint(ctx, target, provider, p.family, p.endpoint)
+			outcomes <- outcome{family: p.family, result: result, err: err}
+		}(probe)
 	}
 	var ipv4Err, ipv6Err error
 	result := domain.ProbeResult{Status: domain.ProbeStatusUnhealthy, Provider: provider}
-	for range 2 {
+	for range len(targets) {
 		current := <-outcomes
+		// 同族多个候选时：已有健康结果则保留，否则以最新结果覆盖（健康者最终胜出）。
 		if current.family == "ipv4" {
-			result.IPv4, ipv4Err = current.result, current.err
+			if result.IPv4.Status != domain.ProbeStatusHealthy {
+				result.IPv4, ipv4Err = current.result, current.err
+			}
 		} else {
-			result.IPv6, ipv6Err = current.result, current.err
+			if result.IPv6.Status != domain.ProbeStatusHealthy {
+				result.IPv6, ipv6Err = current.result, current.err
+			}
 		}
 	}
 	result.TestedAt = time.Now().UTC()
@@ -619,11 +627,24 @@ func (m *Manager) logProbeSetupFailure(ctx context.Context, node domain.Node, pr
 	m.log().WarnContext(ctx, "egress_probe_failed", attributes...)
 }
 
-func probeEndpoints(provider domain.ProbeProvider) (string, string) {
+type probeTarget struct {
+	family   string
+	endpoint string
+}
+
+func probeTargets(provider domain.ProbeProvider) []probeTarget {
 	if provider.Normalized() == domain.ProbeProviderCloudflare {
-		return cloudflareIPv4ProbeEndpoint, cloudflareIPv6ProbeEndpoint
+		return []probeTarget{
+			{family: "ipv4", endpoint: cloudflareIPv4ProbeEndpoint},
+			{family: "ipv6", endpoint: cloudflareIPv6ProbeEndpoint},
+			// 回落候选：仅当域名端点拿不到合法 v4（如 WARP 出口）时生效。
+			{family: "ipv4", endpoint: cloudflareIPv4ProbeFallbackEndpoint},
+		}
 	}
-	return egressIPv4ProbeEndpoint, egressIPv6ProbeEndpoint
+	return []probeTarget{
+		{family: "ipv4", endpoint: egressIPv4ProbeEndpoint},
+		{family: "ipv6", endpoint: egressIPv6ProbeEndpoint},
+	}
 }
 
 func (m *Manager) probeEgressEndpoint(ctx context.Context, target preparedEgressProbe, provider domain.ProbeProvider, family, targetURL string) (result domain.ProbeFamilyResult, probeErr error) {

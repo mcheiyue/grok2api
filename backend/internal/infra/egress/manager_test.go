@@ -420,8 +420,22 @@ func TestProbeEgressNodeUsesConfiguredCloudflareEndpoints(t *testing.T) {
 }
 
 func TestProbeEndpointsDefaultToCloudflare(t *testing.T) {
-	if ipv4, ipv6 := probeEndpoints(""); ipv4 != cloudflareIPv4ProbeEndpoint || ipv6 != cloudflareIPv6ProbeEndpoint {
-		t.Fatalf("default probe endpoints = %q, %q", ipv4, ipv6)
+	targets := probeTargets(domain.ProbeProviderCloudflare)
+	if len(targets) != 3 {
+		t.Fatalf("cloudflare probe targets = %d, want 3 (ipv4 domain + ipv6 + ipv4 fallback)", len(targets))
+	}
+	if targets[0].family != "ipv4" || targets[0].endpoint != cloudflareIPv4ProbeEndpoint {
+		t.Fatalf("first target = %+v", targets[0])
+	}
+	if targets[1].family != "ipv6" || targets[1].endpoint != cloudflareIPv6ProbeEndpoint {
+		t.Fatalf("second target = %+v", targets[1])
+	}
+	if targets[2].family != "ipv4" || targets[2].endpoint != cloudflareIPv4ProbeFallbackEndpoint {
+		t.Fatalf("fallback target = %+v", targets[2])
+	}
+	fallback := probeTargets(domain.ProbeProviderIPInfo)
+	if len(fallback) != 2 {
+		t.Fatalf("generic probe targets = %d, want 2", len(fallback))
 	}
 }
 
