@@ -361,11 +361,6 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	gatewayService.UpdateRequestTimeout(cfg.Server.RequestTimeout.Value())
 	gatewayService.ConfigureMedia(mediaJobRepo, cfg.Provider.Web.MediaConcurrency)
 	gatewayService.ConfigureMediaAssets(mediaService)
-	gatewayService.ConfigureConsoleTeamCircuit(
-		cfg.Provider.Console.TeamRPMCooldownSec,
-		cfg.Provider.Console.TeamRPSCooldownSec,
-		cfg.Provider.Console.TeamUnknownCooldownSec,
-	)
 	quotaRecoveryService := quotarecoveryapp.NewService(logger, quotaQueue, accountService, cfg.Provider.Web.RecoveryBackoffBase.Value(), cfg.Provider.Web.RecoveryBackoffMax.Value())
 	quotaRecoveryService.SetBulkPool(syncPool)
 	inferenceConcurrency := httpmiddleware.NewConcurrencyGate(cfg.Server.MaxConcurrentRequests)
@@ -416,11 +411,6 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		gatewayService.UpdateMaxAttempts(next.Routing.MaxAttempts)
 		gatewayService.UpdateQualityRetry(qualityRetryRuntime(next.QualityGuard.RequestRetry))
 		gatewayService.UpdateVideoMaxAttempts(next.Routing.VideoMaxAttempts)
-		gatewayService.ConfigureConsoleTeamCircuit(
-			next.Provider.Console.TeamRPMCooldownSec,
-			next.Provider.Console.TeamRPSCooldownSec,
-			next.Provider.Console.TeamUnknownCooldownSec,
-		)
 		gatewayService.UpdateMarkBuildChatDeniedAsReauth(next.Routing.MarkBuildChatDeniedAsReauth)
 		gatewayService.UpdateBuildForbiddenReauthPolicy(next.Accounts.MarkBuildForbiddenReauth, next.Accounts.BuildForbiddenReauthCodes)
 		auditService.UpdateWriterConfig(next.Audit.BatchSize, next.Audit.FlushInterval.Value(), next.Audit.CommitDelay.Value())
@@ -471,7 +461,8 @@ func webProviderConfig(cfg config.Config) webprovider.Config {
 		ChatTimeoutSeconds: int(cfg.Provider.Web.ChatTimeout.Value().Seconds()), StreamIdleTimeoutSeconds: int(cfg.Provider.Web.StreamIdleTimeout.Value().Seconds()),
 		ImageTimeoutSeconds: int(cfg.Provider.Web.ImageTimeout.Value().Seconds()),
 		VideoTimeoutSeconds: int(cfg.Provider.Web.VideoTimeout.Value().Seconds()), MaxInputImageBytes: cfg.Media.MaxImageBytes,
-		AllowNSFW: cfg.Provider.Web.AllowNSFW,
+		AllowNSFW:            cfg.Provider.Web.AllowNSFW,
+		FreeVideoDurationCap: cfg.Provider.Web.FreeVideoDurationCap,
 	}
 }
 
@@ -501,13 +492,15 @@ func accountAutoCleanConfig(value config.AccountsConfig) accountapp.AutoCleanCon
 
 func qualityRetryRuntime(value config.QualityGuardRequestRetryConfig) gateway.QualityRetryRuntime {
 	return gateway.QualityRetryRuntime{
-		Enabled:             value.Enabled,
-		MaxAttempts:         value.MaxAttempts,
-		HoldTimeout:         value.HoldTimeout.Value(),
-		MinOutputTokens:     int64(value.MinOutputTokens),
-		OnExhausted:         value.OnExhausted,
-		AccountCooldown:     value.AccountCooldown.Value(),
-		IdleAccountCooldown: value.IdleAccountCooldown.Value(),
+		Enabled:                         value.Enabled,
+		MaxAttempts:                     value.MaxAttempts,
+		HoldTimeout:                     value.HoldTimeout.Value(),
+		MinOutputTokens:                 int64(value.MinOutputTokens),
+		OnExhausted:                     value.OnExhausted,
+		AccountCooldown:                 value.AccountCooldown.Value(),
+		IdleAccountCooldown:             value.IdleAccountCooldown.Value(),
+		MinEncryptedBytes:               value.MinEncryptedBytes,
+		EncryptedBytesPerReasoningToken: value.EncryptedBytesPerReasoningToken,
 	}
 }
 

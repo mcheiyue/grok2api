@@ -205,7 +205,6 @@ type Service struct {
 	clientKeys                  *clientkeyapp.Service
 	providers                   *provider.Registry
 	selector                    *Selector
-	consoleBreaker              *consoleTeamCircuitBreaker
 	responses                   repository.ResponseRepository
 	maxAttempts                 atomic.Int64
 	videoMaxAttempts            atomic.Int64
@@ -265,7 +264,7 @@ func (s *Service) ConfigureMediaAssets(store videoAssetStore) {
 func NewService(models routeResolver, audits auditRecorder, accounts *accountapp.Service, clientKeys *clientkeyapp.Service, providers *provider.Registry, selector *Selector, responses repository.ResponseRepository, maxAttempts int) *Service {
 	service := &Service{
 		models: models, audits: audits, accounts: accounts, clientKeys: clientKeys, providers: providers,
-		selector: selector, consoleBreaker: newConsoleTeamCircuitBreaker(0, 0, 0), responses: responses, logger: slog.Default(),
+		selector: selector, responses: responses, logger: slog.Default(),
 		rateLimits: make(map[string]teamModelRateLimit), rateLimitTeams: make(map[uint64]teamRateLimitObservation),
 		modelSyncing: make(map[uint64]struct{}),
 	}
@@ -479,15 +478,6 @@ func (s *Service) UpdateMaxAttempts(maxAttempts int) { s.maxAttempts.Store(int64
 // 0 is treated as the general default pool size for legacy configs.
 func (s *Service) UpdateVideoMaxAttempts(maxAttempts int) {
 	s.videoMaxAttempts.Store(int64(maxAttempts))
-}
-
-// ConfigureConsoleTeamCircuit 热更新 Console team 熔断秒数（RPM/RPS/unknown）；≤0 回落默认。
-// 不清除已有冷却条目的 until（新 trip 用新秒数；remaining 仍按旧 until 生效至过期）。
-func (s *Service) ConfigureConsoleTeamCircuit(rpmSec, rpsSec, unknownSec int) {
-	if s == nil {
-		return
-	}
-	s.consoleBreaker = newConsoleTeamCircuitBreaker(rpmSec, rpsSec, unknownSec)
 }
 
 // UpdateMarkBuildChatDeniedAsReauth 热更新 Build chat 永久拒绝是否标 reauthRequired。
@@ -1028,16 +1018,11 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	// A lease recovery probe stays on exactly one account and one rendered proxy
 	// identity. Retrying the same pinned account would provide neither failover
 	// nor new evidence and can multiply a slow/failing probe.
+	holdCfg := s.qualityRetryConfig()
+	qualityHoldEnabled := shouldHoldQualityStream(input, ownership, route, operation, holdCfg)
+	qualityCrossAccountReplay := canReplayQualityHoldAcrossAccounts(input, ownership)
 	attemptPolicy := newRequestRoutingAttemptPolicy(int(s.maxAttempts.Load()), ownership != nil || input.ForcedAccountID != 0)
 	idempotencyID, _ := security.NewOpaqueToken(18)
-	// Console team 熔断：multi-agent 共享键；冷却期内直接 429，避免空转换号。
-	consoleCooldownKey := ""
-	if isConsoleProvider(route.Provider) && ownership == nil {
-		consoleCooldownKey = consoleModelCooldownKey(route.UpstreamModel)
-		if rem := s.consoleBreaker.remaining(consoleCooldownKey); rem > 0 {
-			return nil, &SelectionUnavailableError{Reason: SelectionTeamRateLimit, RetryAfter: rem}
-		}
-	}
 	pricingModel := s.providers.PricingModel(route.Provider, route.UpstreamModel)
 	if err := s.checkLedgerReady(); err != nil {
 		return nil, err
@@ -1050,8 +1035,6 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	excluded := make(map[uint64]bool)
 	failureFingerprints := make(map[string]int)
 	authRecoveryAttempted := make(map[uint64]bool)
-	holdCfg := s.qualityRetryConfig()
-	qualityHoldEnabled := shouldHoldQualityStream(input, ownership, route, operation, holdCfg)
 	// Count accounts that actually reached the upstream. Credential-only skips
 	// do not consume the quality retry budget; refreshes stay on the same account.
 	qualityAccountAttempts := 0
@@ -1136,26 +1119,10 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 				}
 				record.DurationMS = time.Since(startedAt).Milliseconds()
 				record.ErrorCode = errorCode
-				attempts := failureAttempts.snapshot()
-				if !successful && len(attempts) == 0 {
-					statusCode := response.StatusCode
-					failureAttempts.append(audit.Attempt{
-						Source:             audit.AttemptSourceUpstreamHTTP,
-						Stage:              "response_stream",
-						AccountID:          auditAccountID(credential.ID),
-						AccountName:        credential.Name,
-						Method:             http.MethodPost,
-						RequestPath:        sanitizeRequestPath(path),
-						UpstreamURL:        sanitizeUpstreamURL(response.UpstreamURL),
-						StartedAt:          upstreamStartedAt.UTC(),
-						DurationMS:         time.Since(upstreamStartedAt).Milliseconds(),
-						UpstreamStatusCode: &statusCode,
-						UpstreamStatus:     response.Status,
-						ResponseHeaders:    sanitizeDiagnosticHeaders(response.Header),
-						TransportError:     errorCode,
-					})
-					attempts = failureAttempts.snapshot()
+				if !successful && response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
+					failureAttempts.ensureStreamFailureAttempt(credential, upstreamStartedAt, response, errorCode)
 				}
+				attempts := failureAttempts.snapshot()
 				if !successful || len(attempts) > 0 {
 					record.Attempts = attempts
 				}
@@ -1279,6 +1246,13 @@ attemptLoop:
 			if lastFailure == nil {
 				lastErr = err
 			}
+			pinnedID := uint64(0)
+			if ownership != nil {
+				pinnedID = ownership.AccountID
+			} else if input.ForcedAccountID != 0 {
+				pinnedID = input.ForcedAccountID
+			}
+			failureAttempts.captureSelectionFailure(pinnedID, "", err)
 			break
 		}
 		excluded[lease.Credential.ID] = true
@@ -1502,22 +1476,6 @@ attemptLoop:
 				continue
 			}
 		afterTeamRateLimit:
-			// 无结构化元数据时：Console 429 按 RPS/RPM 跳闸本地 team 熔断；RPM 不再换号空转。
-			if response.StatusCode == http.StatusTooManyRequests && consoleCooldownKey != "" {
-				info := parseConsole429Info(string(body))
-				cooldown, kind := s.consoleBreaker.trip(consoleCooldownKey, info)
-				s.logger.Warn("console_team_circuit_tripped",
-					"request_id", input.RequestID, "key", consoleCooldownKey, "kind", kind,
-					"cooldown_sec", int(cooldown.Seconds()), "account_id", credential.ID)
-				if kind == "rpm" {
-					if lastFailure.AccountScoped {
-						s.selector.MarkFailure(ctx, credential, response.StatusCode, cooldown)
-					}
-					lease.Release()
-					lastErr = &SelectionUnavailableError{Reason: SelectionTeamRateLimit, RetryAfter: cooldown}
-					break attemptLoop
-				}
-			}
 			// Grok Build treats only HTTP 401 as an OAuth authentication failure.
 			// A 403 is already authenticated and must not trigger token rotation or
 			// replay the same request with freshly issued credentials.
@@ -1646,14 +1604,16 @@ attemptLoop:
 						}
 						writeCancel()
 					}
-					if shouldStopForNonAccountFingerprint(failureFingerprints, lastFailure) {
+					if !qualityCrossAccountReplay || shouldStopForNonAccountFingerprint(failureFingerprints, lastFailure) {
 						break
 					}
 					continue
 				}
 				response.Body = replay
-				hasNextAccount := attemptPolicy.hasNext(attempt) && selection.hasAvailableCandidate(excluded, !quotaProbeAttempted)
-				hasNextAccount = hasNextAccount && qualityAccountAttempts < holdCfg.MaxAttempts
+				hasNextAccount := qualityCrossAccountReplay && attemptPolicy.hasNext(attempt) && qualityAccountAttempts < holdCfg.MaxAttempts
+				if hasNextAccount {
+					hasNextAccount = selection != nil && selection.hasAvailableCandidate(excluded, !quotaProbeAttempted)
+				}
 				commit := CommitQualityHold(verdict, qualityAccountAttempts-1, holdCfg.MaxAttempts, hasNextAccount, holdCfg.OnExhausted)
 				if verdict == QualityWithhold {
 					s.applyMissingThinkingPenalty(ctx, input.RequestID, credential, holdCfg.AccountCooldown)
@@ -1735,28 +1695,6 @@ attemptLoop:
 		}
 		discardFallback(true)
 	}
-	// Console team 熔断优先：保留 Retry-After，避免被 UpstreamFailure 盖掉。
-	var teamLimit *SelectionUnavailableError
-	if errors.As(lastErr, &teamLimit) && teamLimit.Reason == SelectionTeamRateLimit {
-		record := auditBase
-		record.StatusCode = http.StatusTooManyRequests
-		record.DurationMS = time.Since(startedAt).Milliseconds()
-		record.ErrorCode = "console_team_rate_limit"
-		record.Attempts = failureAttempts.snapshot()
-		record.CreatedAt = time.Now().UTC()
-		applyAuditEgress(&record, egressTrace, route.Provider)
-		if lastFailure != nil && lastFailure.AccountID != 0 {
-			accountID := lastFailure.AccountID
-			record.AccountID = &accountID
-			record.AccountName = lastFailure.AccountName
-		}
-		persistCtx, cancel := context.WithTimeout(context.Background(), finalizationTimeout)
-		defer cancel()
-		if err := s.audits.Create(persistCtx, record); err != nil {
-			s.logger.Error("request_usage_write_failed", "event_id", record.EventID, "request_id", input.RequestID, "error", err)
-		}
-		return nil, teamLimit
-	}
 	if lastFailure != nil {
 		record := auditBase
 		record.StatusCode = lastFailure.HTTPStatus
@@ -1791,6 +1729,11 @@ attemptLoop:
 		record.Attempts = failureAttempts.snapshot()
 		record.CreatedAt = time.Now().UTC()
 		applyAuditEgress(&record, egressTrace, route.Provider)
+		if selectionFailure.AccountID != 0 {
+			accountID := selectionFailure.AccountID
+			record.AccountID = &accountID
+			record.AccountName = selectionFailure.AccountName
+		}
 		persistCtx, cancel := context.WithTimeout(context.Background(), finalizationTimeout)
 		defer cancel()
 		if err := s.audits.Create(persistCtx, record); err != nil {
@@ -1802,6 +1745,19 @@ attemptLoop:
 	record.StatusCode = http.StatusServiceUnavailable
 	record.DurationMS = time.Since(startedAt).Milliseconds()
 	record.ErrorCode = "upstream_unavailable"
+	if errors.As(lastErr, &selectionFailure) {
+		record.StatusCode = selectionFailure.HTTPStatus()
+		record.ErrorCode = selectionFailure.Code()
+		if selectionFailure.AccountID != 0 {
+			accountID := selectionFailure.AccountID
+			record.AccountID = &accountID
+			record.AccountName = selectionFailure.AccountName
+		}
+	}
+	if record.AccountID == nil && ownership != nil {
+		accountID := ownership.AccountID
+		record.AccountID = &accountID
+	}
 	record.Attempts = failureAttempts.snapshot()
 	record.CreatedAt = time.Now().UTC()
 	applyAuditEgress(&record, egressTrace, route.Provider)
@@ -1815,7 +1771,7 @@ attemptLoop:
 
 func isUpstreamStreamFailure(errorCode string) bool {
 	switch errorCode {
-	case "upstream_stream_incomplete", "upstream_stream_interrupted", "upstream_stream_idle_timeout", "upstream_response_empty":
+	case "upstream_stream_incomplete", "upstream_stream_interrupted", "upstream_stream_idle_timeout", "upstream_response_empty", "upstream_output_loop":
 		return true
 	default:
 		return false
@@ -2162,8 +2118,18 @@ func isRetryable(status int) bool {
 	return status == 402 || status == 403 || status == 429 || status >= 500
 }
 
+func isReasoningRecoveryFailedResponse(response *provider.Response, upstreamProvider accountdomain.Provider) bool {
+	return upstreamProvider == accountdomain.ProviderBuild && response != nil && response.ReasoningRecoveryFailed
+}
+
 func isRetryableResponse(response *provider.Response, upstreamProvider accountdomain.Provider) bool {
-	if response == nil || !isRetryable(response.StatusCode) {
+	if response == nil {
+		return false
+	}
+	if response.StatusCode == http.StatusBadRequest && isReasoningRecoveryFailedResponse(response, upstreamProvider) {
+		return true
+	}
+	if !isRetryable(response.StatusCode) {
 		return false
 	}
 	// Account-scoped payment failures must always rotate accounts.
