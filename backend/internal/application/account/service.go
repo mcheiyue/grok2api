@@ -77,7 +77,7 @@ const (
 	quotaRefreshPollInterval                      = 500 * time.Millisecond
 	quotaRefreshSharedPoll                        = time.Second
 	quotaRefreshBackoffBase                       = time.Second
-	quotaRefreshBackoffMax                        = time.Minute
+	quotaRefreshBackoffMax                        = 30 * time.Minute
 	consoleQuotaRefreshMinInterval                = 30 * time.Second
 	unknownRemoteQuotaProbeDelay    time.Duration = 5 * time.Minute
 	consolePredictedQuotaProbeDelay time.Duration = 24 * time.Hour
