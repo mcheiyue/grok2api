@@ -78,6 +78,7 @@ const (
 	quotaRefreshSharedPoll                        = time.Second
 	quotaRefreshBackoffBase                       = time.Second
 	quotaRefreshBackoffMax                        = 30 * time.Minute
+	quotaRefreshBackoffShiftMax                   = 12
 	consoleQuotaRefreshMinInterval                = 30 * time.Second
 	unknownRemoteQuotaProbeDelay    time.Duration = 5 * time.Minute
 	consolePredictedQuotaProbeDelay time.Duration = 24 * time.Hour
@@ -3664,7 +3665,7 @@ func quotaRefreshRetryDelay(failures int) time.Duration {
 	if failures < 1 {
 		failures = 1
 	}
-	shift := min(failures-1, 6)
+	shift := min(failures-1, quotaRefreshBackoffShiftMax)
 	delay := quotaRefreshBackoffBase * time.Duration(1<<shift)
 	if delay > quotaRefreshBackoffMax {
 		delay = quotaRefreshBackoffMax
