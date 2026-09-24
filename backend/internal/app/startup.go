@@ -24,9 +24,11 @@ const (
 	webQuotaCatchupEvery       = 30 * time.Minute
 	consoleUsageMigrationEvery = 24 * time.Hour
 	consoleUsageMigrationRetry = 5 * time.Minute
-	consoleQuotaStaleAfter     = 6 * time.Hour
-	consoleQuotaCatchupEvery   = time.Minute
-	consoleQuotaCatchupBatch   = 10
+	// console.x.ai 对现有出口 CF 硬拦：catchup 必失败，旧值 6h/1m/10 会死循环打满 CPU。
+	// ponytail: A 方案止血；出口恢复后再回调到 6h/1m/10。
+	consoleQuotaStaleAfter     = 72 * time.Hour
+	consoleQuotaCatchupEvery   = 30 * time.Minute
+	consoleQuotaCatchupBatch   = 1
 	modelCatalogStaleAfter     = 24 * time.Hour
 	modelCatalogCatchupEvery   = 6 * time.Hour
 )
