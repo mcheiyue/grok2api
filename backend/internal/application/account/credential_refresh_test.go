@@ -17,6 +17,26 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
+func TestCredentialRefreshBackoffCapsAtOneHourAfterTenFailures(t *testing.T) {
+	const id = uint64(7)
+	if d := credentialRefreshBackoff(id, 1, 0); d < 30*time.Second || d > 30*time.Second+15*time.Second {
+		t.Fatalf("failure 1 = %v, want ~30s", d)
+	}
+	if d := credentialRefreshBackoff(id, 5, 0); d < 15*time.Minute || d > 15*time.Minute+15*time.Second {
+		t.Fatalf("failure 5 = %v, want ~15m", d)
+	}
+	for _, n := range []int{10, 11, 60, 500} {
+		d := credentialRefreshBackoff(id, n, 0)
+		if d < time.Hour || d > time.Hour+15*time.Second {
+			t.Fatalf("failure %d = %v, want 1h..1h15s", n, d)
+		}
+	}
+	// retryAfter 不得把 10+ 次失败拉回短退避
+	if d := credentialRefreshBackoff(id, 20, 30*time.Minute); d < time.Hour {
+		t.Fatalf("failure 20 with retryAfter = %v, want >= 1h", d)
+	}
+}
+
 func TestEnsureCredentialReusesRotatedTokenAndThrottlesForcedRefresh(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)

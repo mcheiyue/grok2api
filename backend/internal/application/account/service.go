@@ -2787,6 +2787,11 @@ func isRecoverableRefreshErrorCode(code string) bool {
 
 func credentialRefreshBackoff(accountID uint64, failureCount int, retryAfter time.Duration) time.Duration {
 	delays := [...]time.Duration{30 * time.Second, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute, 15 * time.Minute}
+	// ponytail: failureCount>=10 封顶 1h，避免坏 sticky 出口 15 分钟集体重试打满 CPU；
+	// 出口恢复后可回落到 delays 末档 15m。
+	if failureCount >= 10 {
+		return time.Hour + time.Duration((accountID*37)%16)*time.Second
+	}
 	index := max(0, min(failureCount-1, len(delays)-1))
 	delay := delays[index]
 	if retryAfter > delay {

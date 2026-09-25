@@ -112,7 +112,10 @@ func (s *Service) refreshDueCredentials(ctx context.Context) error {
 	if _, err := s.ReconcileCredentialSchedules(ctx); err != nil {
 		return err
 	}
-	for {
+	// ponytail: 批内失败只记日志不整轮 abort，否则坏号失败会把正常 token 刷进
+	// 30s scheduler 空转；上限防止 due 索引不推进时死循环。
+	const maxBatchesPerRun = 128
+	for batchNum := 0; batchNum < maxBatchesPerRun; batchNum++ {
 		ids, err := s.accounts.ListDueCredentialRefreshIDs(ctx, s.now(), credentialRefreshBatchSize)
 		if err != nil {
 			return err
@@ -146,12 +149,13 @@ func (s *Service) refreshDueCredentials(ctx context.Context) error {
 			return fmt.Errorf("自动刷新批次执行失败: %w", batchErr)
 		}
 		if failed > 0 {
-			return fmt.Errorf("自动刷新批次失败 %d/%d", failed, len(ids))
+			s.logger.Warn("credential_refresh_batch_partial_failure", "failed", failed, "total", len(ids))
 		}
 		if len(ids) < credentialRefreshBatchSize {
 			return nil
 		}
 	}
+	return fmt.Errorf("自动刷新连续达到批次上限 %d，可能存在 due 未推进", maxBatchesPerRun)
 }
 
 func (s *Service) nextCredentialRefreshDelay(ctx context.Context) (time.Duration, error) {
