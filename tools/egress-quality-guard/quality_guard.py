@@ -842,7 +842,7 @@ class Guard:
             return False
         key = self._lease_key(node_id, account_id)
         self.state.setdefault("leases", {})[key] = replacement
-        self._clear_lease_recovery(key)
+        # 探针续期不清 recovery：failures 须跨 extend 累积，否则退避恒 30s 短于 cooldown，死循环
         append_state_event(self.state, "lease_quarantine_extended", node_id=node_id, node_name=node.get("name"), reason=reason, account_id=account_id, cooldown_until=replacement.get("cooldownUntil"))
         log_event("lease_quarantine_extended", node_id=node_id, node_name=node.get("name"), reason=reason, account_id=account_id)
         return True
@@ -861,14 +861,15 @@ class Guard:
             classification, reason = classify_result(result, self.config, profile)
         except Exception as exc:
             self._bump_statistic("active", "errors")
-            if not self._extend_lease(node, lease, "recovery_probe_error"):
-                self._defer_lease_recovery(key, now)
+            self._extend_lease(node, lease, "recovery_probe_error")
+            # extend 成功会清 recovery；探针失败必须无条件退避，否则隔离到期即死循环齐射
+            self._defer_lease_recovery(key, now)
             log_event("lease_recovery_probe_failed", node_id=node_id, node_name=node.get("name"), account_id=account_id, error_type=type(exc).__name__)
             return
         self._record_probe(node, result, classification, reason, now)
         if classification != "healthy":
-            if not self._extend_lease(node, lease, reason):
-                self._defer_lease_recovery(key, now)
+            self._extend_lease(node, lease, reason)
+            self._defer_lease_recovery(key, now)
             return
         try:
             restored = self.api.restore_lease(node_id, account_id, version)
