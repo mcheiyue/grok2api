@@ -262,6 +262,10 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	accountService.SetObservedModelStore(observedModelStore)
 	accountService.SetTaskPools(conversionPool, syncPool, refreshPool)
 	accountService.SetDetectPool(detectPool)
+	// 传输层失败自动解除 Resin sticky；baseURL 为空即关闭，行为与旧版一致。
+	if strings.TrimSpace(cfg.ResinAdmin.BaseURL) != "" {
+		accountService.SetStickyReleaser(infraegress.NewResinAdmin(cfg.ResinAdmin.BaseURL, cfg.ResinAdmin.Token, cfg.ResinAdmin.Platform))
+	}
 	if err := accountService.RebuildBuildBotFlagIndex(ctx); err != nil {
 		if runtimeStore != nil {
 			_ = runtimeStore.Close()

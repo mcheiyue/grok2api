@@ -637,6 +637,38 @@ func TestValidateFlareSolverrClearance(t *testing.T) {
 	}
 }
 
+func TestValidateResinAdmin(t *testing.T) {
+	base := defaultConfig()
+	base.Secrets.JWTSecret = "12345678901234567890123456789012"
+	base.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	// 空配置 = 能力关闭，必须通过。
+	if err := base.Validate(); err != nil {
+		t.Fatalf("empty resinAdmin rejected: %v", err)
+	}
+	base.ResinAdmin = ResinAdminConfig{BaseURL: "http://resin:2260", Token: "tok", Platform: "4f5e4dea-d1fb-4e45-b978-24686ab13a0a"}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("valid resinAdmin rejected: %v", err)
+	}
+	base.ResinAdmin.Token = ""
+	if err := base.Validate(); err == nil {
+		t.Fatal("resinAdmin without token accepted")
+	}
+	base.ResinAdmin.Token = "tok"
+	base.ResinAdmin.Platform = ""
+	if err := base.Validate(); err == nil {
+		t.Fatal("resinAdmin without platform accepted")
+	}
+	base.ResinAdmin.Platform = "4f5e4dea-d1fb-4e45-b978-24686ab13a0a"
+	base.ResinAdmin.BaseURL = "ftp://resin:2260"
+	if err := base.Validate(); err == nil {
+		t.Fatal("resinAdmin with ftp scheme accepted")
+	}
+	base.ResinAdmin.BaseURL = "http://user:pass@resin:2260"
+	if err := base.Validate(); err == nil {
+		t.Fatal("resinAdmin with embedded credentials accepted")
+	}
+}
+
 func TestValidateInfrastructureDrivers(t *testing.T) {
 	base := defaultConfig()
 	base.Secrets.JWTSecret = "12345678901234567890123456789012"

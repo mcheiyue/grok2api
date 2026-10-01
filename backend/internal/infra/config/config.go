@@ -68,6 +68,7 @@ type Config struct {
 	Routing           RoutingConfig           `yaml:"routing"`
 	Audit             AuditConfig             `yaml:"audit"`
 	QualityGuard      QualityGuardConfig      `yaml:"qualityGuard"`
+	ResinAdmin        ResinAdminConfig        `yaml:"resinAdmin"`
 	ClientKeyDefaults ClientKeyDefaultsConfig `yaml:"clientKeyDefaults"`
 	Accounts          AccountsConfig          `yaml:"-"`
 }
@@ -306,6 +307,14 @@ type QualityGuardRequestRetryConfig struct {
 type ClientKeyDefaultsConfig struct {
 	RPMLimit      int `yaml:"rpmLimit"`
 	MaxConcurrent int `yaml:"maxConcurrent"`
+}
+
+// ResinAdminConfig 连接 Resin 管理 API，用于传输层失败后自动解除账号
+// sticky lease。baseURL 为空时该能力整体关闭，行为与旧版一致。
+type ResinAdminConfig struct {
+	BaseURL  string `yaml:"baseURL"`
+	Token    string `yaml:"token"`
+	Platform string `yaml:"platform"`
 }
 
 // AccountsConfig 定义可热加载的账号池维护策略；默认全部关闭。
@@ -713,6 +722,9 @@ func (c Config) Validate() error {
 	if err := validateQualityGuardConfig(c.QualityGuard); err != nil {
 		return err
 	}
+	if err := validateResinAdminConfig(c.ResinAdmin); err != nil {
+		return err
+	}
 	if c.ClientKeyDefaults.RPMLimit < 1 || c.ClientKeyDefaults.RPMLimit > clientkeydomain.MaxRPMLimit || c.ClientKeyDefaults.MaxConcurrent < 1 || c.ClientKeyDefaults.MaxConcurrent > clientkeydomain.MaxConcurrent {
 		return errors.New("clientKeyDefaults 超出允许范围")
 	}
@@ -732,6 +744,24 @@ func (c Config) Validate() error {
 	}
 	if len(c.Accounts.BuildForbiddenReauthCodes) == 0 {
 		return errors.New("accounts.buildForbiddenReauthCodes 至少需要一个错误码")
+	}
+	return nil
+}
+
+func validateResinAdminConfig(value ResinAdminConfig) error {
+	baseURL := strings.TrimSpace(value.BaseURL)
+	if baseURL == "" {
+		return nil
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Host == "" || parsed.User != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return errors.New("resinAdmin.baseURL 必须是无凭据的 http(s) 地址")
+	}
+	if strings.TrimSpace(value.Token) == "" {
+		return errors.New("resinAdmin.token 不能为空")
+	}
+	if strings.TrimSpace(value.Platform) == "" {
+		return errors.New("resinAdmin.platform 不能为空")
 	}
 	return nil
 }

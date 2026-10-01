@@ -407,12 +407,19 @@ func (s *Service) Summary(ctx context.Context) (Summary, error) {
 	return result, nil
 }
 
+// StickyReleaser 在 OAuth 传输层失败后解除账号在代理池的 sticky lease，
+// 使下一次刷新换出口而不是继续钉在坏 exit 上。未注入时能力关闭。
+type StickyReleaser interface {
+	ReleaseCredentialSticky(ctx context.Context, credential accountdomain.Credential) error
+}
+
 // Service 负责 OAuth 账号接入、刷新、额度和持久化生命周期。
 type Service struct {
 	accounts            repository.AccountRepository
 	audits              repository.AuditRepository
 	deviceSessions      repository.DeviceSessionRepository
 	sticky              repository.StickySessionRepository
+	stickyReleaser      StickyReleaser
 	refreshLock         repository.DistributedLock
 	concurrency         repository.ConcurrencyLimiter
 	quotaQueue          repository.QuotaRecoveryQueue
@@ -530,6 +537,11 @@ func (s *Service) SetDetectPool(pool *batch.Pool) {
 	if pool != nil {
 		s.detectPool = pool
 	}
+}
+
+// SetStickyReleaser 注入传输层失败后的 sticky 解除器；nil 表示关闭。
+func (s *Service) SetStickyReleaser(value StickyReleaser) {
+	s.stickyReleaser = value
 }
 
 func (s *Service) SetLogger(logger *slog.Logger) {
@@ -2690,6 +2702,11 @@ func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential
 		"build_api_fallback_marked", credential.BuildAPIFallback,
 		"distributed_lock", distributedLock,
 	)
+	// 传输层失败说明当前 sticky exit 对该账号不可用；异步解除 lease，
+	// 失败只记日志，不影响退避与后续刷新。
+	if errorCode == "oauth_transport_error" && credential.EgressNodeID != 0 && s.stickyReleaser != nil {
+		s.releaseCredentialStickyAsync(credential)
+	}
 	if permanent && accessTokenAlive {
 		s.logger.Warn("credential_refresh_permanent_but_token_alive", "account_id", credential.ID, "error_code", errorCode, "expires_at", credential.ExpiresAt, "retry_at", retryAt)
 		s.WakeCredentialRefresh()
@@ -2716,6 +2733,28 @@ func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential
 	}
 	s.logger.Warn("credential_refresh_deferred", "account_id", credential.ID, "failure_count", failureCount, "retry_at", retryAt, "error_code", errorCode)
 	s.WakeCredentialRefresh()
+}
+
+// releaseCredentialStickyAsync 异步解除该凭据的 sticky lease；HTTP 由
+// Releaser 自带超时兜底，这里只隔离 goroutine，任何失败仅记日志。
+func (s *Service) releaseCredentialStickyAsync(credential accountdomain.Credential) {
+	releaser := s.stickyReleaser
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := releaser.ReleaseCredentialSticky(ctx, credential); err != nil {
+			s.logger.Warn("sticky_release_failed",
+				"account_id", credential.ID,
+				"egress_node_id", credential.EgressNodeID,
+				"error", err,
+			)
+			return
+		}
+		s.logger.Info("sticky_released",
+			"account_id", credential.ID,
+			"egress_node_id", credential.EgressNodeID,
+		)
+	}()
 }
 
 func normalizeCredentialRefreshErrorMessage(value string) string {
