@@ -264,7 +264,11 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	accountService.SetDetectPool(detectPool)
 	// 传输层失败自动解除 Resin sticky；baseURL 为空即关闭，行为与旧版一致。
 	if strings.TrimSpace(cfg.ResinAdmin.BaseURL) != "" {
-		accountService.SetStickyReleaser(infraegress.NewResinAdmin(cfg.ResinAdmin.BaseURL, cfg.ResinAdmin.Token, cfg.ResinAdmin.Platform))
+		resinAdmin := infraegress.NewResinAdmin(cfg.ResinAdmin.BaseURL, cfg.ResinAdmin.Token, cfg.ResinAdmin.Platform)
+		resinAdmin.SetLogger(logger)
+		resinAdmin.SetNodePlatformResolver(egressManager.PlatformPrefix)
+		accountService.SetStickyReleaser(resinAdmin)
+		webAdapter.SetStickyReleaser(resinAdmin)
 	}
 	if err := accountService.RebuildBuildBotFlagIndex(ctx); err != nil {
 		if runtimeStore != nil {

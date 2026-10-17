@@ -1241,6 +1241,40 @@ func renderAccountProxyURL(template, accountKey string) (string, error) {
 	return strings.ReplaceAll(template, application.ProxyAccountPlaceholder, accountKey), nil
 }
 
+// PlatformPrefix 解析节点代理模板里的平台前缀（socks5h://US.{account}@resin:2260 → "US"），
+// Resin 的 lease 按平台寻址，删租约必须落到账号前缀所属的平台。
+func (m *Manager) PlatformPrefix(ctx context.Context, nodeID uint64) (string, error) {
+	if nodeID == 0 {
+		return "", nil
+	}
+	node, err := m.repository.GetEgressNode(ctx, nodeID)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(node.EncryptedProxyURL) == "" {
+		return "", nil
+	}
+	raw, err := m.cipher.Decrypt(node.EncryptedProxyURL)
+	if err != nil {
+		return "", err
+	}
+	return proxyPlatformPrefix(raw), nil
+}
+
+func proxyPlatformPrefix(raw string) string {
+	_, rest, ok := strings.Cut(strings.TrimSpace(raw), "://")
+	if !ok {
+		return ""
+	}
+	userinfo, _, ok := strings.Cut(rest, "@")
+	if !ok {
+		return ""
+	}
+	username, _, _ := strings.Cut(userinfo, ":")
+	prefix, _, _ := strings.Cut(username, ".")
+	return strings.TrimSpace(prefix)
+}
+
 func normalizeProxyAccount(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {

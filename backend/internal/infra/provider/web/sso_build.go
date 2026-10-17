@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
@@ -43,6 +45,17 @@ type ssoBuildFlow struct {
 	cookies   map[string]string
 }
 
+// stickyReleaser 与 account.StickyReleaser 同形，web 侧不反向依赖 application 层。
+type stickyReleaser interface {
+	ReleaseCredentialSticky(ctx context.Context, credential accountdomain.Credential) error
+	ReleaseStickyOnNode(ctx context.Context, credential accountdomain.Credential, nodeID uint64) error
+}
+
+const (
+	stickyReleaseCooldown = 10 * time.Minute
+	stickyReleaseTimeout  = 10 * time.Second
+)
+
 func (a *Adapter) ConvertToBuild(ctx context.Context, credential accountdomain.Credential) (provider.CredentialSeed, error) {
 	if credential.Provider != accountdomain.ProviderWeb || credential.AuthType != accountdomain.AuthTypeSSO {
 		return provider.CredentialSeed{}, fmt.Errorf("仅 Grok Web SSO 账号支持转换")
@@ -69,10 +82,94 @@ func (a *Adapter) ConvertToBuild(ctx context.Context, credential accountdomain.C
 	seed, err := flow.convert(requestCtx, credential)
 	if err != nil {
 		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, conversionStatus(err), err)
+		a.releaseStickyAfterConversion(credential, lease.NodeID, err)
 		return provider.CredentialSeed{}, err
 	}
 	a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusOK, nil)
 	return seed, nil
+}
+
+// releaseStickyAfterConversion 只对出口类传输失败异步解除租约（L1 自愈触发点）；
+// 业务失败（401/consent/解析）不触发，每账号 10 分钟冷却防打爆 Resin admin，
+// 任何失败仅记日志、不阻断转换主流程。
+func (a *Adapter) releaseStickyAfterConversion(credential accountdomain.Credential, nodeID uint64, err error) {
+	releaser := a.stickyReleaser
+	if releaser == nil || nodeID == 0 || !isEgressTransportFailure(err) {
+		return
+	}
+	if !a.markStickyReleaseDue(credential.ID) {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), stickyReleaseTimeout)
+		defer cancel()
+		if releaseErr := releaser.ReleaseStickyOnNode(ctx, credential, nodeID); releaseErr != nil {
+			a.log().Warn("sticky_release_failed",
+				"account_id", credential.ID,
+				"egress_node_id", nodeID,
+				"error", releaseErr,
+			)
+			return
+		}
+		a.log().Info("sticky_released",
+			"account_id", credential.ID,
+			"egress_node_id", nodeID,
+		)
+	}()
+}
+
+// markStickyReleaseDue 记录每账号释放时刻并在冷却窗口内放行；惰性清理
+// 过期条目，条目量受转换频率约束（7k 账号 × 10 分钟窗口）。
+func (a *Adapter) markStickyReleaseDue(accountID uint64) bool {
+	now := time.Now()
+	a.stickyMu.Lock()
+	defer a.stickyMu.Unlock()
+	if a.stickyReleaseAt == nil {
+		a.stickyReleaseAt = make(map[uint64]time.Time)
+	}
+	for id, at := range a.stickyReleaseAt {
+		if now.Sub(at) >= stickyReleaseCooldown {
+			delete(a.stickyReleaseAt, id)
+		}
+	}
+	if at, ok := a.stickyReleaseAt[accountID]; ok && now.Sub(at) < stickyReleaseCooldown {
+		return false
+	}
+	a.stickyReleaseAt[accountID] = now
+	return true
+}
+
+// isEgressTransportFailure 判定转换失败是否为出口类传输错误（决定是否换租约）。
+// EOF/reset/超时/dial 失败 = 出口问题；HTTP 状态错误、业务拒绝（consent/解析/401）
+// 与客户端主动取消不触发释放。
+func isEgressTransportFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	var statusErr conversionHTTPError
+	if errors.As(err, &statusErr) {
+		return false
+	}
+	if errors.Is(err, provider.ErrUnauthorized) || errors.Is(err, provider.ErrAuthorizationDenied) {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return false
 }
 
 func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Credential) (provider.CredentialSeed, error) {

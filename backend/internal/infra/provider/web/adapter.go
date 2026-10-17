@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
@@ -39,11 +40,20 @@ type Adapter struct {
 	assets          provider.ImageAssetStore
 	statsig         *statsigSigner
 	logger          *slog.Logger
+
+	stickyReleaser  stickyReleaser
+	stickyMu        sync.Mutex
+	stickyReleaseAt map[uint64]time.Time
 }
 
 func NewAdapter(cfg Config, egress *infraegress.Manager, cipher *security.Cipher, states repository.ResponseRepository, assets provider.ImageAssetStore) *Adapter {
 	cfg = normalizedConfig(cfg)
 	return &Adapter{cfg: cfg, accountsBaseURL: officialAccountsBaseURL, egress: egress, cipher: cipher, states: states, assets: assets, statsig: newStatsigSigner(), logger: slog.Default()}
+}
+
+// SetStickyReleaser 注入转换传输失败后的租约解除器；nil（未配置 resinAdmin）即关闭，行为与旧版一致。
+func (a *Adapter) SetStickyReleaser(value stickyReleaser) {
+	a.stickyReleaser = value
 }
 
 func (a *Adapter) SetLogger(logger *slog.Logger) {
