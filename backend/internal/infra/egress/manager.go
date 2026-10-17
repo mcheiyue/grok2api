@@ -592,7 +592,9 @@ func (m *Manager) prepareEgressProbe(node domain.Node) (preparedEgressProbe, str
 		return target, "normalize_proxy", message, errors.New(message)
 	}
 	if strings.Contains(proxyURL, application.ProxyAccountPlaceholder) {
-		proxyURL, err = renderAccountProxyURL(proxyURL, "egress_probe")
+		// 每节点唯一探针身份：硬编码 egress_probe 会让所有粘性节点共用同一
+		// Resin lease → 同一出口，探针结果恒同、健康判据失真。
+		proxyURL, err = renderAccountProxyURL(proxyURL, "probe_"+strconv.FormatUint(node.ID, 10))
 		if err != nil {
 			return target, "render_proxy_identity", "账号代理模板无效", err
 		}

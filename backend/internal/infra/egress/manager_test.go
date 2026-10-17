@@ -419,6 +419,30 @@ func TestProbeEgressNodeUsesConfiguredCloudflareEndpoints(t *testing.T) {
 	}
 }
 
+func TestPrepareEgressProbeUsesPerNodeIdentity(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encryptedProxy, err := cipher.Encrypt("socks5h://US.{account}@resin:2260")
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := domain.Node{ID: 42, Name: "sticky", Scope: domain.ScopeWeb, EncryptedProxyURL: encryptedProxy}
+	manager := NewManager(&mutableEgressRepository{node: node}, cipher)
+
+	target, stage, _, err := manager.prepareEgressProbe(node)
+	if err != nil {
+		t.Fatalf("prepareEgressProbe failed at %s: %v", stage, err)
+	}
+	if !strings.Contains(target.proxyURL, "probe_42") {
+		t.Fatalf("proxyURL = %q, want per-node identity probe_42", target.proxyURL)
+	}
+	if strings.Contains(target.proxyURL, "egress_probe") {
+		t.Fatalf("proxyURL = %q, shared identity egress_probe must be gone", target.proxyURL)
+	}
+}
+
 func TestProbeEndpointsDefaultToCloudflare(t *testing.T) {
 	targets := probeTargets(domain.ProbeProviderCloudflare)
 	if len(targets) != 3 {
