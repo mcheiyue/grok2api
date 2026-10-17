@@ -2,8 +2,10 @@ package web
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -75,7 +77,7 @@ func TestSSOBuildFlowConvertsEndToEndWithConsentToken(t *testing.T) {
 			`{"device_code":"dc","user_code":"uc","interval":1,"expires_in":1800}`))},
 		{StatusCode: http.StatusSeeOther, Header: http.Header{"Location": []string{"https://accounts.x.ai/oauth2/device/consent"}}, Body: io.NopCloser(strings.NewReader(""))},
 		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(
-			`<form method="post"><input value="eyJhbGciOiJFUzI1NiJ9.eyJkYyI6ImRjIn0.sig" type="hidden" name="consent_token"></form>`))},
+			`<form method="post"><input value="` + consentTestToken + `" type="hidden" name="consent_token"></form>`))},
 		{StatusCode: http.StatusSeeOther, Header: http.Header{"Location": []string{"https://accounts.x.ai/oauth2/device/done"}}, Body: io.NopCloser(strings.NewReader(""))},
 		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(
 			`{"access_token":"access","refresh_token":"refresh","expires_in":3600}`))},
@@ -130,8 +132,44 @@ func TestSSOBuildFlowConvertsEndToEndWithConsentToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if approveForm.Get("consent_token") != "eyJhbGciOiJFUzI1NiJ9.eyJkYyI6ImRjIn0.sig" {
+	if approveForm.Get("consent_token") != consentTestToken {
 		t.Fatalf("approve form missing consent_token: %q", approveForm.Get("consent_token"))
+	}
+}
+
+func TestSSOBuildFlowApprovesWithoutConsentTokenWhenAbsent(t *testing.T) {
+	client := &scriptedSSOClient{responses: []*http.Response{
+		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(
+			`{"device_code":"dc","user_code":"uc","interval":1,"expires_in":1800}`))},
+		{StatusCode: http.StatusSeeOther, Header: http.Header{"Location": []string{"https://accounts.x.ai/oauth2/device/consent"}}, Body: io.NopCloser(strings.NewReader(""))},
+		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(
+			`<html><body>consent page without token</body></html>`))},
+		{StatusCode: http.StatusSeeOther, Header: http.Header{"Location": []string{"https://accounts.x.ai/oauth2/device/done"}}, Body: io.NopCloser(strings.NewReader(""))},
+		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(
+			`{"access_token":"access","refresh_token":"refresh","expires_in":3600}`))},
+	}}
+	flow := &ssoBuildFlow{
+		client: client, userAgent: "lease-agent",
+		cookies: map[string]string{"sso": "live"},
+		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	seed, err := flow.convert(context.Background(), fakeCredential())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seed.AccessToken != "access" {
+		t.Fatalf("seed = %#v", seed)
+	}
+	body, err := io.ReadAll(client.requests[3].Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	form, err := url.ParseQuery(string(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if form.Get("consent_token") != "" || form.Get("user_code") != "uc" {
+		t.Fatalf("approve form = %q", string(body))
 	}
 }
 
@@ -194,16 +232,31 @@ func TestExtractConsentToken(t *testing.T) {
 	}
 }
 
-func TestConsentTokenMustMatchDeviceCode(t *testing.T) {
-	token := "eyJhbGciOiJFUzI1NiJ9.eyJkYyI6ImRjIn0.sig"
-	if !consentTokenMatchesDevice(token, "dc") {
-		t.Fatal("consent token for current device code was rejected")
+var consentTestToken = testJWT(`{"aud":"consent","dc":"c325ce0e-02b0-4b2b-866e-f548875e4de8"}`)
+
+func testJWT(payload string) string {
+	encode := func(value string) string { return base64.RawURLEncoding.EncodeToString([]byte(value)) }
+	return encode(`{"alg":"ES256"}`) + "." + encode(payload) + ".sig"
+}
+
+func TestConsentTokenValid(t *testing.T) {
+	if !consentTokenValid(consentTestToken, "") {
+		t.Fatal("dc 为 UUID、与 device_code 不等的有效令牌应被接受")
 	}
-	if consentTokenMatchesDevice(token, "other-device") {
-		t.Fatal("consent token for a different device code was accepted")
+	if !consentTokenValid(testJWT(`{"aud":"consent","sub":"user-1"}`), "user-1") {
+		t.Fatal("subject-matching consent token rejected")
 	}
-	if consentTokenMatchesDevice("not-a-jwt", "dc") {
-		t.Fatal("malformed consent token was accepted")
+	if consentTokenValid(testJWT(`{"aud":"consent","sub":"user-1"}`), "user-2") {
+		t.Fatal("consent token for another subject accepted")
+	}
+	if consentTokenValid(testJWT(`{"aud":"other"}`), "") {
+		t.Fatal("token without aud=consent accepted")
+	}
+	if consentTokenValid(testJWT(`{"aud":"consent","exp":1}`), "") {
+		t.Fatal("expired consent token accepted")
+	}
+	if consentTokenValid("not-a-jwt", "") {
+		t.Fatal("malformed consent token accepted")
 	}
 }
 

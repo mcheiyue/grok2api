@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -33,6 +34,7 @@ const (
 	ssoApproveURL    = "https://auth.x.ai/oauth2/device/approve"
 	ssoTokenURL      = "https://auth.x.ai/oauth2/token"
 	maxAuthBody      = 2 << 20
+	consentAudience  = "consent"
 )
 
 type ssoBuildHTTPClient interface {
@@ -43,6 +45,14 @@ type ssoBuildFlow struct {
 	client    ssoBuildHTTPClient
 	userAgent string
 	cookies   map[string]string
+	logger    *slog.Logger
+}
+
+func (f *ssoBuildFlow) log() *slog.Logger {
+	if f.logger != nil {
+		return f.logger
+	}
+	return slog.Default()
 }
 
 // stickyReleaser 与 account.StickyReleaser 同形，web 侧不反向依赖 application 层。
@@ -78,6 +88,7 @@ func (a *Adapter) ConvertToBuild(ctx context.Context, credential accountdomain.C
 	flow := &ssoBuildFlow{
 		client: lease, userAgent: lease.UserAgent,
 		cookies: ssoBuildCookies(token, lease.CFCookies),
+		logger:  a.log(),
 	}
 	seed, err := flow.convert(requestCtx, credential)
 	if err != nil {
@@ -234,14 +245,21 @@ func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Cre
 		}
 		consentToken = extractConsentToken(consentBody)
 	}
-	if !consentTokenMatchesDevice(consentToken, device.DeviceCode) {
-		return provider.CredentialSeed{}, fmt.Errorf("SSO 自动批准 Device Flow 失败：未获取 consent_token")
+	// consent_token 仅在通过校验时回传；缺失或不可用时不阻断，按面板路径继续 approve
+	// （面板从不校验也不回传该令牌，实测 48/48 成功）。
+	approveForm := url.Values{
+		"user_code": {device.UserCode}, "action": {"allow"}, "principal_type": {"User"}, "principal_id": {""},
+	}
+	if consentTokenValid(consentToken, credential.UserID) {
+		approveForm.Set("consent_token", consentToken)
+	} else {
+		f.log().Warn("sso_consent_token_unusable",
+			"account_id", credential.ID,
+			"token_present", consentToken != "",
+		)
 	}
 
-	status, finalURL, _, err = f.doWithFollowHeaders(ctx, http.MethodPost, ssoApproveURL, url.Values{
-		"user_code": {device.UserCode}, "action": {"allow"}, "principal_type": {"User"}, "principal_id": {""},
-		"consent_token": {consentToken},
-	}, false, map[string]string{
+	status, finalURL, _, err = f.doWithFollowHeaders(ctx, http.MethodPost, ssoApproveURL, approveForm, false, map[string]string{
 		"Origin":                    "https://accounts.x.ai",
 		"Referer":                   consentPageURL,
 		"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -545,12 +563,32 @@ func extractConsentToken(body []byte) string {
 	return ""
 }
 
-func consentTokenMatchesDevice(token, deviceCode string) bool {
+// consentTokenValid 校验 consent_token 是否为 xAI 签发的有效 consent 令牌。
+// 不能用 device_code 比对：实测（见 docs/chen-fork-SSO-Build-consent差异核对.md §8）token 的
+// dc claim 是 UUID，而 device_code 是 opaque 串，两者永不相等，旧判据会恒假误报。
+func consentTokenValid(token, expectedSubject string) bool {
 	parts := strings.Split(token, ".")
-	if len(parts) != 3 || parts[0] == "" || parts[2] == "" {
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
 		return false
 	}
-	return claimString(decodeBuildClaims(token), "dc") == deviceCode && deviceCode != ""
+	claims := decodeBuildClaims(token)
+	if claims == nil || claimString(claims, "aud") != consentAudience {
+		return false
+	}
+	if expected := strings.TrimSpace(expectedSubject); expected != "" && claimString(claims, "sub") != expected {
+		return false
+	}
+	if exp := claimNumber(claims, "exp"); exp > 0 && time.Now().After(time.Unix(exp, 0)) {
+		return false
+	}
+	return true
+}
+
+func claimNumber(claims map[string]any, key string) int64 {
+	if value, ok := claims[key].(float64); ok {
+		return int64(value)
+	}
+	return 0
 }
 
 func decodeBuildClaims(token string) map[string]any {
