@@ -2,6 +2,8 @@ package web
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -28,11 +30,17 @@ import (
 
 const (
 	ssoBuildClientID = "b1a00492-073a-47ea-816f-4c329264a828"
-	ssoBuildScope    = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write"
+	ssoBuildScope    = "openid profile email offline_access grok-cli:access api:access"
+	ssoAuthorizeURL  = "https://auth.x.ai/oauth2/authorize"
 	ssoDeviceURL     = "https://auth.x.ai/oauth2/device/code"
 	ssoVerifyURL     = "https://auth.x.ai/oauth2/device/verify"
 	ssoApproveURL    = "https://auth.x.ai/oauth2/device/approve"
 	ssoTokenURL      = "https://auth.x.ai/oauth2/token"
+	ssoRedirectURI   = "http://127.0.0.1:56121/callback"
+	ssoGrokReferrer  = "grok-build"
+	ssoGrokPlan      = "generic"
+	ssoNextActionID  = "401ce882800a9c98c11b0066c135231259bc3b003a"
+	ssoGrokTokenUA   = "grok-pager/0.2.93 grok-shell/0.2.93 (linux; x86_64)"
 	maxAuthBody      = 2 << 20
 	consentAudience  = "consent"
 )
@@ -184,6 +192,18 @@ func isEgressTransportFailure(err error) bool {
 }
 
 func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Credential) (provider.CredentialSeed, error) {
+	seed, err := f.convertWithAuthCode(ctx, credential)
+	if err == nil {
+		return seed, nil
+	}
+	f.log().Warn("sso_auth_code_fallback_to_device",
+		"account_id", credential.ID,
+		"auth_code_error", err,
+	)
+	return f.convertWithDeviceFlow(ctx, credential)
+}
+
+func (f *ssoBuildFlow) convertWithDeviceFlow(ctx context.Context, credential accountdomain.Credential) (provider.CredentialSeed, error) {
 	form := url.Values{"client_id": {ssoBuildClientID}, "scope": {ssoBuildScope}}
 	status, _, body, err := f.do(ctx, http.MethodPost, ssoDeviceURL, form)
 	if err != nil {
@@ -286,6 +306,244 @@ func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Cre
 	if err != nil {
 		return provider.CredentialSeed{}, err
 	}
+	return f.buildCredentialSeed(credential, token)
+}
+
+func (f *ssoBuildFlow) convertWithAuthCode(ctx context.Context, credential accountdomain.Credential) (provider.CredentialSeed, error) {
+	verifier, challenge, err := generatePKCE()
+	if err != nil {
+		return provider.CredentialSeed{}, fmt.Errorf("生成 PKCE 密钥: %w", err)
+	}
+	state, err := randomHex(16)
+	if err != nil {
+		return provider.CredentialSeed{}, fmt.Errorf("生成 OAuth state: %w", err)
+	}
+	nonce, err := randomHex(16)
+	if err != nil {
+		return provider.CredentialSeed{}, fmt.Errorf("生成 OAuth nonce: %w", err)
+	}
+
+	params := url.Values{
+		"client_id":             {ssoBuildClientID},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+		"nonce":                 {nonce},
+		"plan":                  {ssoGrokPlan},
+		"redirect_uri":          {ssoRedirectURI},
+		"referrer":              {ssoGrokReferrer},
+		"response_type":         {"code"},
+		"scope":                 {ssoBuildScope},
+		"state":                 {state},
+	}
+	authorizeURL := ssoAuthorizeURL + "?" + params.Encode()
+
+	status, finalURL, body, err := f.doWithFollow(ctx, http.MethodGet, authorizeURL, nil, true)
+	if err != nil {
+		return provider.CredentialSeed{}, fmt.Errorf("打开 authorize 页面失败: %w", err)
+	}
+	if status == http.StatusUnauthorized || strings.Contains(finalURL, "sign-in") || strings.Contains(finalURL, "sign-up") {
+		return provider.CredentialSeed{}, provider.ErrUnauthorized
+	}
+	if !strings.Contains(finalURL, "/oauth2/consent") {
+		return provider.CredentialSeed{}, fmt.Errorf("authorize 未进入 consent 流程: url=%s status=%d", finalURL, status)
+	}
+
+	actionIDs := extractNextActionIDs(string(body))
+	if len(actionIDs) == 0 {
+		actionIDs = []string{ssoNextActionID}
+	}
+
+	consentPayload, err := json.Marshal([]map[string]any{{
+		"action":              "allow",
+		"clientId":            ssoBuildClientID,
+		"redirectUri":         ssoRedirectURI,
+		"scope":               ssoBuildScope,
+		"state":               state,
+		"codeChallenge":       challenge,
+		"codeChallengeMethod": "S256",
+		"nonce":               nonce,
+		"principalType":       "User",
+		"principalId":         "",
+		"referrer":            ssoGrokReferrer,
+	}})
+	if err != nil {
+		return provider.CredentialSeed{}, fmt.Errorf("编码 consent payload: %w", err)
+	}
+
+	var authCode string
+	for _, actionID := range actionIDs {
+		status, _, respBody, postErr := f.doRawPost(ctx, finalURL, consentPayload, map[string]string{
+			"Content-Type": "text/plain;charset=UTF-8",
+			"Accept":       "text/x-component",
+			"Origin":       "https://accounts.x.ai",
+			"Referer":      finalURL,
+			"Next-Action":  actionID,
+		})
+		if postErr != nil {
+			f.log().Warn("sso_next_action_request_failed", "action_id", actionID, "error", postErr)
+			continue
+		}
+		if status < 200 || status >= 300 {
+			f.log().Warn("sso_next_action_http_error", "action_id", actionID, "status", status)
+			continue
+		}
+		code, parseErr := parseConsentResult(string(respBody))
+		if parseErr != "" {
+			f.log().Warn("sso_consent_server_rejected", "action_id", actionID, "error", parseErr)
+			return provider.CredentialSeed{}, fmt.Errorf("consent 被服务端拒绝: %s", parseErr)
+		}
+		if code != "" {
+			authCode = code
+			break
+		}
+	}
+	if authCode == "" {
+		return provider.CredentialSeed{}, fmt.Errorf("所有 Next-Action 均未返回 authorization code")
+	}
+
+	tokenForm := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {authCode},
+		"redirect_uri":  {ssoRedirectURI},
+		"client_id":     {ssoBuildClientID},
+		"code_verifier": {verifier},
+	}
+	status, _, tokenBody, err := f.doWithFollowHeaders(ctx, http.MethodPost, ssoTokenURL, tokenForm, false, map[string]string{
+		"User-Agent":            ssoGrokTokenUA,
+		"X-Grok-Client-Version": "0.2.93",
+		"Accept":                "*/*",
+	})
+	if err != nil {
+		return provider.CredentialSeed{}, fmt.Errorf("Auth Code 换取 Token 传输错误: %w", err)
+	}
+	if status < 200 || status >= 300 {
+		return provider.CredentialSeed{}, fmt.Errorf("Auth Code 换取 Token 失败 (HTTP %d): %s", status, string(tokenBody))
+	}
+
+	var tokenPayload struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		IDToken      string `json:"id_token"`
+		ExpiresIn    int    `json:"expires_in"`
+		TokenType    string `json:"token_type"`
+	}
+	if err := json.Unmarshal(tokenBody, &tokenPayload); err != nil {
+		return provider.CredentialSeed{}, fmt.Errorf("解析 OAuth Token 响应: %w", err)
+	}
+	if tokenPayload.AccessToken == "" {
+		return provider.CredentialSeed{}, fmt.Errorf("OAuth Token 缺少 access_token")
+	}
+	if tokenPayload.ExpiresIn <= 0 {
+		tokenPayload.ExpiresIn = 21600
+	}
+
+	token := ssoBuildToken{
+		AccessToken:  tokenPayload.AccessToken,
+		RefreshToken: tokenPayload.RefreshToken,
+		IDToken:      tokenPayload.IDToken,
+		ExpiresAt:    time.Now().UTC().Add(time.Duration(tokenPayload.ExpiresIn) * time.Second),
+	}
+	return f.buildCredentialSeed(credential, token)
+}
+
+func (f *ssoBuildFlow) doRawPost(ctx context.Context, endpoint string, payload []byte, headers map[string]string) (int, string, []byte, error) {
+	if !safeXAIURL(endpoint) {
+		return 0, "", nil, fmt.Errorf("xAI OAuth URL 不安全")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(payload)))
+	if err != nil {
+		return 0, "", nil, err
+	}
+	request.Header.Set("User-Agent", f.userAgent)
+	request.Header.Set("Cookie", f.cookieHeader())
+	for k, v := range headers {
+		request.Header.Set(k, v)
+	}
+	response, err := f.client.Do(request)
+	if err != nil {
+		return 0, "", nil, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	f.captureCookies(response)
+	data, readErr := io.ReadAll(io.LimitReader(response.Body, maxAuthBody+1))
+	if readErr != nil {
+		return response.StatusCode, endpoint, nil, readErr
+	}
+	return response.StatusCode, endpoint, data, nil
+}
+
+func generatePKCE() (string, string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", "", err
+	}
+	verifier := base64.RawURLEncoding.EncodeToString(raw)
+	h := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(h[:])
+	return verifier, challenge, nil
+}
+
+func randomHex(bytesLen int) (string, error) {
+	b := make([]byte, bytesLen)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", b), nil
+}
+
+var (
+	nextActionRegexes = []*regexp.Regexp{
+		regexp.MustCompile(`(?i)(?:\$ACTION_ID_|next-action["']?\s*[:=]\s*["']|["'])([0-9a-f]{40,44})["']`),
+		regexp.MustCompile(`(?i)createServerReference\)?\(["']([0-9a-f]{40,44})["']`),
+		regexp.MustCompile(`(?i)["']([0-9a-f]{40,44})["']\s*,\s*(?:callServer|findSourceMapURL)`),
+	}
+)
+
+func extractNextActionIDs(htmlContent string) []string {
+	var list []string
+	seen := make(map[string]bool)
+	add := func(id string) {
+		id = strings.ToLower(strings.TrimSpace(id))
+		if len(id) >= 40 && len(id) <= 44 && !seen[id] {
+			seen[id] = true
+			list = append(list, id)
+		}
+	}
+	add(ssoNextActionID)
+	for _, re := range nextActionRegexes {
+		for _, m := range re.FindAllStringSubmatch(htmlContent, -1) {
+			if len(m) > 1 {
+				add(m[1])
+			}
+		}
+	}
+	return list
+}
+
+func parseConsentResult(responseBody string) (string, string) {
+	var errText string
+	for _, line := range strings.Split(responseBody, "\n") {
+		idx := strings.Index(line, "{")
+		if idx < 0 {
+			continue
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(line[idx:]), &parsed); err != nil {
+			continue
+		}
+		if code, ok := parsed["code"].(string); ok && code != "" && parsed["success"] != false {
+			return code, ""
+		}
+		if errMsg, ok := parsed["error"].(string); ok && errMsg != "" {
+			errText = errMsg
+		} else if success, ok := parsed["success"].(bool); ok && !success && errText == "" {
+			errText = "success=false"
+		}
+	}
+	return "", errText
+}
+
+func (f *ssoBuildFlow) buildCredentialSeed(credential accountdomain.Credential, token ssoBuildToken) (provider.CredentialSeed, error) {
 	claims := decodeBuildClaims(firstValue(token.IDToken, token.AccessToken))
 	userID := claimString(claims, "sub")
 	email := claimString(claims, "email")

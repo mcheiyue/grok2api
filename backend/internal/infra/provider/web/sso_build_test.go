@@ -55,6 +55,38 @@ func TestSSOBuildFlowFollowsOnlyTrustedXAIHTTPSRedirects(t *testing.T) {
 	}
 }
 
+func TestSSOBuildFlowConvertsEndToEndWithAuthCode(t *testing.T) {
+	client := &scriptedSSOClient{responses: []*http.Response{
+		{StatusCode: http.StatusFound, Header: http.Header{"Location": []string{"https://accounts.x.ai/oauth2/consent"}}, Body: io.NopCloser(strings.NewReader(""))},
+		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(
+			`<html><body><form action="/oauth2/consent"><input type="hidden" name="state" value="s"/></form></body></html>`))},
+		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(
+			`0:{"code":"test_auth_code_123"}` + "\n"))},
+		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(
+			`{"access_token":"auth_code_access","refresh_token":"auth_code_refresh","expires_in":21600,"token_type":"Bearer"}`))},
+	}}
+	flow := &ssoBuildFlow{client: client, userAgent: "lease-agent", cookies: map[string]string{"sso": "live"}}
+	seed, err := flow.convertWithAuthCode(context.Background(), fakeCredential())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seed.AccessToken != "auth_code_access" || seed.RefreshToken != "auth_code_refresh" {
+		t.Fatalf("seed = %#v", seed)
+	}
+	if len(client.requests) != 4 {
+		t.Fatalf("requests = %d, want 4 (authorize, consent_page, next-action, token)", len(client.requests))
+	}
+	if !strings.Contains(client.requests[0].URL.Path, "authorize") {
+		t.Fatalf("req[0] url = %s", client.requests[0].URL.String())
+	}
+	if client.requests[2].Header.Get("Next-Action") == "" {
+		t.Fatal("req[2] missing Next-Action header")
+	}
+	if !strings.Contains(client.requests[3].URL.Path, "token") {
+		t.Fatalf("req[3] url = %s", client.requests[3].URL.String())
+	}
+}
+
 func TestSSOBuildFlowMapsDeadSSOToUnauthorized(t *testing.T) {
 	client := &scriptedSSOClient{responses: []*http.Response{
 		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(
@@ -62,7 +94,7 @@ func TestSSOBuildFlowMapsDeadSSOToUnauthorized(t *testing.T) {
 		{StatusCode: http.StatusSeeOther, Header: http.Header{"Location": []string{"https://accounts.x.ai/sign-in"}}, Body: io.NopCloser(strings.NewReader(""))},
 	}}
 	flow := &ssoBuildFlow{client: client, userAgent: "lease-agent", cookies: map[string]string{"sso": "dead"}}
-	_, err := flow.convert(context.Background(), fakeCredential())
+	_, err := flow.convertWithDeviceFlow(context.Background(), fakeCredential())
 	if !errors.Is(err, provider.ErrUnauthorized) {
 		t.Fatalf("err = %v, want ErrUnauthorized", err)
 	}
@@ -83,7 +115,7 @@ func TestSSOBuildFlowConvertsEndToEndWithConsentToken(t *testing.T) {
 			`{"access_token":"access","refresh_token":"refresh","expires_in":3600}`))},
 	}}
 	flow := &ssoBuildFlow{client: client, userAgent: "lease-agent", cookies: ssoBuildCookies("live", "cf_clearance=clearance")}
-	seed, err := flow.convert(context.Background(), fakeCredential())
+	seed, err := flow.convertWithDeviceFlow(context.Background(), fakeCredential())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +185,7 @@ func TestSSOBuildFlowApprovesWithoutConsentTokenWhenAbsent(t *testing.T) {
 		cookies: map[string]string{"sso": "live"},
 		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	seed, err := flow.convert(context.Background(), fakeCredential())
+	seed, err := flow.convertWithDeviceFlow(context.Background(), fakeCredential())
 	if err != nil {
 		t.Fatal(err)
 	}
