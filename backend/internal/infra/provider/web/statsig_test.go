@@ -472,3 +472,46 @@ func TestStatsigSignFailureIsCachedBriefly(t *testing.T) {
 		t.Fatalf("fetches = %d, want 2 after cooldown", fetches)
 	}
 }
+
+func TestStatsigStaleValueHonoursFailureCooldown(t *testing.T) {
+	now := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	raw := make([]byte, 70)
+	raw[0] = 1
+	stale := base64.RawStdEncoding.EncodeToString(raw)
+	signer := newStatsigSigner()
+	signer.now = func() time.Time { return now }
+	fetches := 0
+	signer.fetchMeta = func(context.Context, string, string, *infraegress.Lease) (string, error) {
+		fetches++
+		return "", errStatsigMetaMissing
+	}
+	const (
+		baseURL   = "https://grok.com"
+		signerURL = "https://signer.example/sign"
+		target    = "https://grok.com/rest/test"
+	)
+	key, _, err := statsigSignatureKey(baseURL, signerURL, http.MethodPost, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer.store(key, stale, now.Add(-time.Minute), now)
+	sign := func() (string, string, error) {
+		return signer.Sign(context.Background(), baseURL, signerURL, "token", nil, http.MethodPost, target)
+	}
+	for i := 0; i < 3; i++ {
+		value, source, err := sign()
+		if err != nil || value != stale || source != "stale" {
+			t.Fatalf("call %d: value=%q source=%q err=%v", i, value, source, err)
+		}
+	}
+	if fetches != 1 {
+		t.Fatalf("fetches = %d, want 1 (stale fallback must not refetch on every call)", fetches)
+	}
+	now = now.Add(statsigFailureTTL + time.Second)
+	if _, _, err := sign(); err != nil {
+		t.Fatalf("stale fallback must keep working after cooldown: %v", err)
+	}
+	if fetches != 2 {
+		t.Fatalf("fetches = %d, want 2 after cooldown", fetches)
+	}
+}

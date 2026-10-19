@@ -89,6 +89,9 @@ func (s *statsigSigner) Sign(ctx context.Context, baseURL, signerURL, token stri
 		return value, "cache", nil
 	}
 	if failure, ok := s.failed(key, now); ok {
+		if stale, staleOK := s.stale(key); staleOK {
+			return stale, "stale", nil
+		}
 		return "", "", failure
 	}
 	value, err, _ := s.refreshes.Do(key, func() (any, error) {
@@ -97,14 +100,17 @@ func (s *statsigSigner) Sign(ctx context.Context, baseURL, signerURL, token stri
 			return statsigSignResult{value: cached, source: "cache"}, nil
 		}
 		if failure, ok := s.failed(key, now); ok {
+			if stale, staleOK := s.stale(key); staleOK {
+				return statsigSignResult{value: stale, source: "stale"}, nil
+			}
 			return statsigSignResult{}, failure
 		}
 		fresh, refreshErr := s.freshSignature(ctx, baseURL, signerURL, token, lease, method, path)
 		if refreshErr != nil {
-			if stale, ok := s.stale(key); ok {
+			s.markFailed(key, refreshErr, now)
+			if stale, staleOK := s.stale(key); staleOK {
 				return statsigSignResult{value: stale, source: "stale"}, nil
 			}
-			s.markFailed(key, refreshErr, now)
 			return statsigSignResult{}, refreshErr
 		}
 		s.clearFailure(key)
