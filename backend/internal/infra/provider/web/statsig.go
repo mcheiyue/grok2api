@@ -28,6 +28,8 @@ const (
 	statsigCacheMaxEntries  = 4096
 	statsigMetaBodyLimit    = 4 << 20
 	statsigResponseLimit    = 4 << 10
+	// 抓 meta 失败后对同一签名键冷却，避免上游缺 meta 时每请求都重抓整页。
+	statsigFailureTTL = time.Minute
 )
 
 var errStatsigMetaMissing = errors.New("Grok index 缺少 grok-site-verification")
@@ -35,6 +37,11 @@ var errStatsigMetaMissing = errors.New("Grok index 缺少 grok-site-verification
 type statsigCacheEntry struct {
 	value     string
 	expiresAt time.Time
+}
+
+type statsigFailure struct {
+	err   error
+	until time.Time
 }
 
 type statsigSignResult struct {
@@ -54,6 +61,7 @@ type statsigSigner struct {
 	now              func() time.Time
 	mu               sync.Mutex
 	entries          map[string]statsigCacheEntry
+	failures         map[string]statsigFailure
 	refreshes        singleflight.Group
 }
 
@@ -67,6 +75,7 @@ func newStatsigSigner() *statsigSigner {
 		validateEndpoint: validateStatsigSignerEndpoint,
 		now:              time.Now,
 		entries:          make(map[string]statsigCacheEntry),
+		failures:         make(map[string]statsigFailure),
 	}
 }
 
@@ -75,21 +84,30 @@ func (s *statsigSigner) Sign(ctx context.Context, baseURL, signerURL, token stri
 	if err != nil {
 		return "", "", err
 	}
-	if value, ok := s.cached(key, s.now().UTC()); ok {
+	now := s.now().UTC()
+	if value, ok := s.cached(key, now); ok {
 		return value, "cache", nil
+	}
+	if failure, ok := s.failed(key, now); ok {
+		return "", "", failure
 	}
 	value, err, _ := s.refreshes.Do(key, func() (any, error) {
 		now := s.now().UTC()
 		if cached, ok := s.cached(key, now); ok {
 			return statsigSignResult{value: cached, source: "cache"}, nil
 		}
+		if failure, ok := s.failed(key, now); ok {
+			return statsigSignResult{}, failure
+		}
 		fresh, refreshErr := s.freshSignature(ctx, baseURL, signerURL, token, lease, method, path)
 		if refreshErr != nil {
 			if stale, ok := s.stale(key); ok {
 				return statsigSignResult{value: stale, source: "stale"}, nil
 			}
+			s.markFailed(key, refreshErr, now)
 			return statsigSignResult{}, refreshErr
 		}
+		s.clearFailure(key)
 		s.store(key, fresh, now.Add(statsigCacheTTL), now)
 		return statsigSignResult{value: fresh, source: "refresh"}, nil
 	})
@@ -166,12 +184,14 @@ func (s *statsigSigner) Invalidate(baseURL, signerURL, method, target string) {
 	}
 	s.mu.Lock()
 	delete(s.entries, key)
+	delete(s.failures, key)
 	s.mu.Unlock()
 }
 
 func (s *statsigSigner) Clear() {
 	s.mu.Lock()
 	clear(s.entries)
+	clear(s.failures)
 	s.mu.Unlock()
 }
 
@@ -190,6 +210,35 @@ func (s *statsigSigner) stale(key string) (string, bool) {
 	defer s.mu.Unlock()
 	entry, ok := s.entries[key]
 	return entry.value, ok && validStatsigID(entry.value)
+}
+
+func (s *statsigSigner) failed(key string, now time.Time) (error, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	failure, ok := s.failures[key]
+	if !ok || !now.Before(failure.until) {
+		return nil, false
+	}
+	return failure.err, true
+}
+
+func (s *statsigSigner) markFailed(key string, err error, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.failures) >= statsigCacheMaxEntries {
+		for existingKey, failure := range s.failures {
+			if !now.Before(failure.until) {
+				delete(s.failures, existingKey)
+			}
+		}
+	}
+	s.failures[key] = statsigFailure{err: err, until: now.Add(statsigFailureTTL)}
+}
+
+func (s *statsigSigner) clearFailure(key string) {
+	s.mu.Lock()
+	delete(s.failures, key)
+	s.mu.Unlock()
 }
 
 func (s *statsigSigner) store(key, value string, expiresAt, now time.Time) {

@@ -437,3 +437,38 @@ func TestStatsigInvalidationOnlyAppliesToURLMode(t *testing.T) {
 		t.Fatal("URL Statsig must be invalidated after anti-bot rejection")
 	}
 }
+
+func TestStatsigSignFailureIsCachedBriefly(t *testing.T) {
+	now := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	signer := newStatsigSigner()
+	signer.now = func() time.Time { return now }
+	fetches := 0
+	signer.fetchMeta = func(context.Context, string, string, *infraegress.Lease) (string, error) {
+		fetches++
+		return "", errStatsigMetaMissing
+	}
+	const (
+		baseURL   = "https://grok.com"
+		signerURL = "https://signer.example/sign"
+	)
+	sign := func() error {
+		_, _, err := signer.Sign(context.Background(), baseURL, signerURL, "token", nil, http.MethodPost, "https://grok.com/rest/test")
+		return err
+	}
+	if err := sign(); err == nil {
+		t.Fatal("expected first failure")
+	}
+	if err := sign(); err == nil {
+		t.Fatal("expected second failure")
+	}
+	if fetches != 1 {
+		t.Fatalf("fetches = %d, want 1 (cooldown must suppress the repeat)", fetches)
+	}
+	now = now.Add(statsigFailureTTL + time.Second)
+	if err := sign(); err == nil {
+		t.Fatal("expected failure after cooldown")
+	}
+	if fetches != 2 {
+		t.Fatalf("fetches = %d, want 2 after cooldown", fetches)
+	}
+}
