@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +31,9 @@ const (
 	statsigResponseLimit    = 4 << 10
 	// 抓 meta 失败后对同一签名键冷却，避免上游缺 meta 时每请求都重抓整页。
 	statsigFailureTTL = time.Minute
+	// Log gate: callers can invoke Sign tens of times per second (quota catch-up),
+	// so one warning per path per minute keeps the real signal visible.
+	statsigReportInterval = time.Minute
 )
 
 var errStatsigMetaMissing = errors.New("Grok index 缺少 grok-site-verification")
@@ -62,6 +66,7 @@ type statsigSigner struct {
 	mu               sync.Mutex
 	entries          map[string]statsigCacheEntry
 	failures         map[string]statsigFailure
+	reports          map[string]time.Time
 	refreshes        singleflight.Group
 }
 
@@ -76,6 +81,7 @@ func newStatsigSigner() *statsigSigner {
 		now:              time.Now,
 		entries:          make(map[string]statsigCacheEntry),
 		failures:         make(map[string]statsigFailure),
+		reports:          make(map[string]time.Time),
 	}
 }
 
@@ -245,6 +251,37 @@ func (s *statsigSigner) clearFailure(key string) {
 	s.mu.Lock()
 	delete(s.failures, key)
 	s.mu.Unlock()
+}
+
+func (s *statsigSigner) shouldReport(path string, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if at, ok := s.reports[path]; ok && now.Sub(at) < statsigReportInterval {
+		return false
+	}
+	if len(s.reports) >= statsigCacheMaxEntries {
+		s.reports = make(map[string]time.Time)
+	}
+	s.reports[path] = now
+	return true
+}
+
+// shortcut: returns a one-line caller stack to identify hot Sign callers; drop it
+// once that investigation closes.
+func statsigCallSite() string {
+	lines := strings.Split(string(debug.Stack()), "\n")
+	var frames []string
+	for _, line := range lines[1:] {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.Contains(line, "runtime/debug.") || strings.Contains(line, "statsigCallSite") {
+			continue
+		}
+		frames = append(frames, line)
+		if len(frames) == 6 {
+			break
+		}
+	}
+	return strings.Join(frames, " | ")
 }
 
 func (s *statsigSigner) store(key, value string, expiresAt, now time.Time) {
@@ -498,7 +535,9 @@ func (a *Adapter) applySignedStatsig(ctx context.Context, request *http.Request,
 		}
 		return
 	}
-	a.log().Warn("web_statsig_fetch_failed", "method", request.Method, "path", request.URL.EscapedPath(), "error", err)
+	if a.statsig.shouldReport(request.URL.EscapedPath(), a.statsig.now().UTC()) {
+		a.log().Warn("web_statsig_fetch_failed", "method", request.Method, "path", request.URL.EscapedPath(), "error", err, "caller", statsigCallSite())
+	}
 }
 
 // WarmStatsig 只使用一个 Web 账号和一个出口租约预热共享签名，不会逐账号访问上游。

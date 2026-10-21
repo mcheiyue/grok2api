@@ -515,3 +515,23 @@ func TestStatsigStaleValueHonoursFailureCooldown(t *testing.T) {
 		t.Fatalf("fetches = %d, want 2 after cooldown", fetches)
 	}
 }
+
+func TestStatsigFailureLogIsRateLimitedPerPath(t *testing.T) {
+	signer := newStatsigSigner()
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	path := "/rest/media/imagine/quota_info"
+	if !signer.shouldReport(path, now) {
+		t.Fatal("first failure must be reported")
+	}
+	for i := 0; i < 5; i++ {
+		if signer.shouldReport(path, now.Add(time.Duration(i)*time.Second)) {
+			t.Fatalf("repeat within window must be silenced (i=%d)", i)
+		}
+	}
+	if !signer.shouldReport("/rest/rate-limits", now.Add(time.Second)) {
+		t.Fatal("different paths must not share the gate")
+	}
+	if !signer.shouldReport(path, now.Add(statsigReportInterval)) {
+		t.Fatal("report must resume after the interval")
+	}
+}
