@@ -2686,6 +2686,7 @@ func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential
 	s.logger.Warn("credential_refresh_failed",
 		"account_id", credential.ID,
 		"provider", credential.Provider,
+		"refresh_error", refreshErr,
 		"http_status", errorStatus,
 		"error_code", errorCode,
 		"error_message", errorMessage,

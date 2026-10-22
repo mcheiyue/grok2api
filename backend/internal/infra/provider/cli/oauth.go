@@ -323,9 +323,21 @@ func (c *oauthClient) postForm(ctx context.Context, endpoint string, form url.Va
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("xAI OAuth 返回 %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		// 必须带上游状态码：否则上层只能记为 oauth_transport_error(status=0)，429/5xx 与网络故障无法区分。
+		return &provider.CredentialRefreshError{
+			Status:  resp.StatusCode,
+			Code:    "oauth_http_error",
+			Message: fmt.Sprintf("xAI OAuth HTTP %d: %s", resp.StatusCode, truncateOAuthDiagnostic(strings.TrimSpace(string(body)), 200)),
+		}
 	}
-	return json.Unmarshal(body, output)
+	if err := json.Unmarshal(body, output); err != nil {
+		return &provider.CredentialRefreshError{
+			Code:    "oauth_decode_error",
+			Message: "OAuth response decode failed",
+			Cause:   err,
+		}
+	}
+	return nil
 }
 
 func (c *oauthClient) applyDeviceHeaders(req *http.Request) {
