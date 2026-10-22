@@ -2509,6 +2509,18 @@ func (s *Service) ensureCredential(ctx context.Context, value accountdomain.Cred
 			return nil, fmt.Errorf("Provider %s 未注册", latest.Provider)
 		}
 		refreshed, err := adapter.RefreshCredential(ctx, latest)
+		// 连接级失败换出口重试一次：释放 sticky lease 后重新取号会换到别的节点，
+		// 避免"撞坏节点 → 1h 退避 → 再撞同一批坏节点 → token 过期"的累积。
+		if err != nil && s.stickyReleaser != nil && isRetryableRefreshEgressError(err) {
+			if releaseErr := s.releaseCredentialSticky(ctx, latest); releaseErr == nil {
+				s.logger.Info("credential_refresh_retry_new_exit",
+					"account_id", latest.ID,
+					"egress_node_id", latest.EgressNodeID,
+					"error", err,
+				)
+				refreshed, err = adapter.RefreshCredential(ctx, latest)
+			}
+		}
 		if err != nil {
 			persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), credentialRefreshStateTTL)
 			s.recordCredentialRefreshFailure(persistCtx, latest, err, !options.retryPermanentOnce, release != nil)
@@ -2738,24 +2750,43 @@ func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential
 
 // releaseCredentialStickyAsync 异步解除该凭据的 sticky lease；HTTP 由
 // Releaser 自带超时兜底，这里只隔离 goroutine，任何失败仅记日志。
+// isRetryableRefreshEgressError 只把"路不通"判为可换出口：未分类的裸错误（EOF、
+// 超时）以及 oauth_timeout。上游给了 HTTP 状态（oauth_http_error）或账号判死
+// （invalid_grant 等 typed 错误）换节点没有意义，重试只会加大上游压力。
+func isRetryableRefreshEgressError(err error) bool {
+	var typed *provider.CredentialRefreshError
+	if !errors.As(err, &typed) {
+		return !errors.Is(err, context.Canceled)
+	}
+	return typed.Code == "oauth_timeout"
+}
+
 func (s *Service) releaseCredentialStickyAsync(credential accountdomain.Credential) {
-	releaser := s.stickyReleaser
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := releaser.ReleaseCredentialSticky(ctx, credential); err != nil {
-			s.logger.Warn("sticky_release_failed",
-				"account_id", credential.ID,
-				"egress_node_id", credential.EgressNodeID,
-				"error", err,
-			)
-			return
-		}
-		s.logger.Info("sticky_released",
+		_ = s.releaseCredentialSticky(context.Background(), credential)
+	}()
+}
+
+func (s *Service) releaseCredentialSticky(ctx context.Context, credential accountdomain.Credential) error {
+	releaser := s.stickyReleaser
+	if releaser == nil {
+		return errors.New("sticky releaser 未配置")
+	}
+	releaseCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := releaser.ReleaseCredentialSticky(releaseCtx, credential); err != nil {
+		s.logger.Warn("sticky_release_failed",
 			"account_id", credential.ID,
 			"egress_node_id", credential.EgressNodeID,
+			"error", err,
 		)
-	}()
+		return err
+	}
+	s.logger.Info("sticky_released",
+		"account_id", credential.ID,
+		"egress_node_id", credential.EgressNodeID,
+	)
+	return nil
 }
 
 func normalizeCredentialRefreshErrorMessage(value string) string {

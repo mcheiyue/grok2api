@@ -860,6 +860,7 @@ type credentialRefreshAdapter struct {
 	billing      accountdomain.Billing
 	billingErr   error
 	refreshErr   error
+	errs         []error
 	afterRefresh func()
 }
 
@@ -887,6 +888,9 @@ func (a *credentialRefreshAdapter) RefreshCredential(ctx context.Context, _ acco
 		}
 	}
 	count := a.refreshCount.Add(1)
+	if int(count) <= len(a.errs) && a.errs[count-1] != nil {
+		return provider.RefreshedCredential{}, a.errs[count-1]
+	}
 	if a.refreshErr != nil {
 		return provider.RefreshedCredential{}, a.refreshErr
 	}
